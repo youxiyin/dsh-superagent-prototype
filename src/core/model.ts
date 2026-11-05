@@ -124,6 +124,10 @@ export type MandateBasis = Received & { sender?: string; rules?: string[] } & (
 
 /** Immutable authorization produced by an accept decision; execution is bounded by it and it never changes. */
 export interface Mandate {
+  /** Missing on legacy tickets, which always execute as repo tickets. */
+  kind?: 'repo' | 'general'
+  /** Canonical absolute workspace of a general ticket, fixed when accepted. */
+  directory?: string
   strength: Strength
   policyVersion: string
   /** How the gate admitted it, for re-validation and audit. */

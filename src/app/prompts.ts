@@ -9,6 +9,7 @@ import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
 import { Versions } from './versions.ts'
 import { KV } from '../kv.ts'
+import { promptFile } from './skill-files.ts'
 
 /** Prompt sections the team writes; the built-in parts follow dsh-superagent's text until the team overrides them. */
 export const TEAM_SECTIONS = ['communication', 'scope', 'delivery'] as const
@@ -40,6 +41,13 @@ export interface PromptVersion { revision: number; previousRevision: number | nu
   /** Original unmigrated config preserved when differences cannot be compared across schema versions. */
   legacy?: { config: unknown } }
 export const defaultPrompts = (): PromptConfig => ({ ...teamDefaults, skills: {} })
+const generalWorkerPrompt = promptFile('worker-general')
+/** General work keeps explicit team customizations without the repository prompt defaults. */
+export function composeGeneralPrompt(config: PromptConfig, environment: string): string {
+  const team = TEAM_SECTIONS.filter(name => config[name] !== teamDefaults[name])
+    .flatMap(name => config[name] ? [`## ${TEAM_HEADINGS[name]}\n${config[name]}`] : [])
+  return [builtIn(config, 'runtime/shared'), generalWorkerPrompt, ...team, environment].filter(Boolean).join('\n\n')
+}
 
 const ENVIRONMENT_HEADING = 'Execution environment (from this installation\'s settings; it takes precedence over any repository or account named elsewhere in these instructions; an empty value means that part is not configured here). The prepare command of a ticket directory reads the same variables:'
 const POLICY_HEAD = '## Policy\nPolicy version {version}; accept mode {mode}. The accept mode and the rules decide proactive candidates only: an explicit request is routed as dispatch says, in any mode and whatever the rules.'
@@ -140,6 +148,11 @@ export class Prompts {
   }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
   compose(config: PromptConfig, role: Role, variables = this.environment()): string {
+    const ticketId = variables?.find(variable => variable.key === 'DSH_SUPERAGENT_TICKET')?.value
+    if (role === 'worker' && ticketId && this.store.tickets.get(ticketId)?.mandate.kind === 'general') {
+      const workspace = variables?.filter(variable => variable.owner === 'executor')
+      return composeGeneralPrompt(config, `Execution directory and ticket:\n${environmentLines(workspace ?? [])}`)
+    }
     return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
   }
   /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */

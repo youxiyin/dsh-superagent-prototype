@@ -1,5 +1,6 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
+import { fleetTools } from './fleet.ts'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
@@ -13,7 +14,7 @@ import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
   readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
-  readonly sessions: Pick<Sessions, 'relay' | 'notify'>
+  readonly sessions: Pick<Sessions, 'relay' | 'notify' | 'prompt'>
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
@@ -23,6 +24,7 @@ export interface ExecutorToolsHost {
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
   return [
+    ...fleetTools(host.resources, host.sessions, ticket),
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
@@ -76,18 +78,20 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       description: 'Report progress, ready, blocked, failed or dropped, as the work and handoff sections say.',
       schema: z.object({
         state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
-        summary: z.string().min(1),
+        summary: z.string().min(1).describe('Verbatim report body; limited by executor.fleet.reportMaxChars (default 20000). Shorten and resubmit if refused.'),
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
       }).strict(),
       execute: async (args, signal) => {
+        const maxChars = host.resources.store.settings().executor.fleet.reportMaxChars
+        if (args.summary.length > maxChars) throw new Error(`Report has ${args.summary.length} characters; maximum is ${maxChars}. Shorten the summary and resubmit; no report was recorded.`)
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
-        return host.store.atomic(() => {
+        const result = host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
@@ -97,8 +101,20 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
-          return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
+          const result = { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
+          if (args.state === 'dropped' || args.state === 'progress' && !args.reply_to_trigger_id && !args.human_action) return result
+          // Queue with the report transaction. A Channel refusal preserves the report and is returned explicitly;
+          // neither the host nor the orchestrator may truncate or rewrite the body to make it fit.
+          try {
+            const reply = host.engine.reply({ purpose: 'report', ticketId, triggerId: args.reply_to_trigger_id })
+            return { ...result, reply }
+          } catch (error) { return { ...result, delivery_error: String(error) } }
         })
+        if ('reply' in result && result.reply) {
+          await host.sendReplies()
+          return { ...result, reply: { id: result.reply.id, status: host.store.replyStatus(result.reply.id)! } }
+        }
+        return result
       },
     }),
   ]

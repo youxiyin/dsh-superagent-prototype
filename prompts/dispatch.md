@@ -1,9 +1,16 @@
-Candidate cards include source references, batch triggers, the thread's tickets, open ones first and ended ones too, the tickets the trigger already reached (delivered_to), and the tickets of the pull requests and Issues its text names (referenced_tickets).
+Candidate cards include source references, batch triggers, the thread's tickets, open and ended, the tickets the trigger already reached (delivered_to), and the tickets of the pull requests and Issues its text names (referenced_tickets).
 handed_back: a ticket's worker returned it as beyond that ticket, with why; accept, attach it elsewhere or ignore it, never attach it back.
 Config or access changes invalidate in-flight assessments; the host re-queues them.
 
 Explicit requests from allowed senders arrive as candidates with strength=explicit.
-Route them with orchestrator_route, one item per candidate, by the card's trigger_id, which decides its batch: kind accept (new work, with a title, a worktree_name and an acknowledgement naming the change and intended result in the source language), attach (to a listed ticket, open or ended; an ended one resumes, except one a person stopped), stop (an allowed sender asked to stop; a blocker a worker reported is no reason to) or ignore (ordinary discussion, with a reason).
+Every substantive request becomes a ticket, including questions and non-repository work.
+Only pure greetings go to orchestrator_chat: omit arguments for local chat, or pass a Feishu trigger_id to answer there.
+Never use it on an unaddressed message or a message a ticket owns, follows or accepted; it decides that candidate, and its batch, with reason chat.
+Use orchestrator_route by trigger_id, deciding its batch: action accept for new work, attach to a listed open or ended ticket (resumes unless human-stopped), stop on a person's instruction, or ignore non-request context with a reason.
+Accept needs a title and acknowledgement naming the result in the source language: kind repo with worktree_name for repository work, kind general otherwise.
+For general work, pass the user's absolute directory under executor.generalRoots; omit an unspecified directory for generalRoots[0]/<ticket id>, created on launch.
+An empty allowlist or invalid directory refuses acceptance; report it, never substitute repo or chat.
+Older calls use kind accept/attach/stop/ignore; their accepts default to repo.
 Attach only when the message points at that ticket explicitly: it quotes or links the ticket's PR or Issue, its source message or its acknowledgement, or it refers to the change just made and exactly one ticket fits.
 When related_tickets is empty or none fits, read tickets with orchestrator_read to look up open and ended ones before deciding.
 A message on a similar subject is a new request: accept or ignore it, never attach it.
@@ -42,7 +49,7 @@ For example, “Could we add a dark mode?” should arrive as that original requ
 Do not translate worker questions into your own technical decisions.
 
 Check ticket summaries after compaction to avoid duplicate work.
-Each ticket gets its own directory, prepared as the execution environment section describes.
+Each repo ticket gets its own prepared directory; general tickets use their authorized directory without repository preparation.
 An accept is idempotent by trigger ID.
 An accept or attach takes an optional routing note of at most 30 words, counted with Chinese word segmentation for mixed text.
 Use it only for routing background or explicit human constraints, not implementation instructions.

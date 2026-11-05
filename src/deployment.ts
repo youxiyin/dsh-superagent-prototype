@@ -1,6 +1,7 @@
 /** Plugin configuration and startup verification for repository access and agent CLI identities. */
 import { LIMITS } from './limits.ts'
 import { accessSync, constants, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
@@ -20,6 +21,10 @@ export const Config = s.object({
     .description('Pages of thread context one assessment may read.').volatile(),
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
+  assistantDir: absolute('Working directory of the general-assistant Sessions that answer non-repository requests from the main Session and Feishu.')
+    .default(join(homedir(), '.dsh', 'superagent-assistant')),
+  assistantTimeoutMs: s.number().min(LIMITS.assistantTimeoutMs.min).max(LIMITS.assistantTimeoutMs.max).step(1000)
+    .default(600000).description('Time limit of one general-assistant turn, in milliseconds.').volatile(),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export interface Machine {
@@ -27,6 +32,8 @@ export interface Machine {
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
+  assistantDir: string
+  assistantTimeoutMs: Volatile<number>
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
@@ -38,8 +45,8 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, assistantDir, assistantTimeoutMs } = config
+  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, assistantDir, assistantTimeoutMs }
 }
 
 export const GithubAccountsSchema = z.object({

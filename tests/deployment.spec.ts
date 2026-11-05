@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -45,8 +45,9 @@ describe('configuration schema', () => {
     const read = machineOf(Config({ stateDir: join(dir, 'state') }))
     // Limits are volatile references that the loader updates in place and callers read when used.
     expect({ ...read, promptMaxChars: read.promptMaxChars.get(), admissionContextMaxPages: read.admissionContextMaxPages.get(),
-      admissionContextTimeoutMs: read.admissionContextTimeoutMs.get() })
-      .toEqual({ stateDir: join(dir, 'state'), promptMaxChars: 100000, admissionContextMaxPages: 10, admissionContextTimeoutMs: 15000 })
+      admissionContextTimeoutMs: read.admissionContextTimeoutMs.get(), assistantTimeoutMs: read.assistantTimeoutMs.get() })
+      .toEqual({ stateDir: join(dir, 'state'), promptMaxChars: 100000, admissionContextMaxPages: 10, admissionContextTimeoutMs: 15000,
+        assistantDir: join(homedir(), '.dsh', 'superagent-assistant'), assistantTimeoutMs: 600000 })
     expect(() => Config(minimal({ stateDir: 'relative/dir' }))).toThrow()
     expect(() => Config(minimal({ stateDir: '~/dir' }))).toThrow()
   })

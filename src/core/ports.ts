@@ -42,7 +42,7 @@ export type AssessmentOutcome =
   | { kind: 'unavailable'; reason: string | Reason; audit?: Record<string, unknown> }
   /** An accept: `rules` the assessment matched, `name` the ticket's requested short name, and `note` a routing note for its worker. */
   | { kind: 'accept'; title: string; scope: string; reason: string | Reason; acknowledgement?: string; rules?: string[]; audit?: Record<string, unknown>;
-    name?: string; note?: string }
+    name?: string; note?: string; ticketKind?: 'repo' | 'general'; directory?: string }
   | { kind: 'stop'; ticketId: string; reason: string | Reason; audit?: Record<string, unknown> }
 
 /** Semantic judgement. `request` queues the assessment, idempotently per `evalId`; the outcome returns through `Engine.decide`. */
@@ -68,8 +68,8 @@ export interface Executor {
   stop(ticket: Ticket, assignment: Assignment, reason: string): void
 }
 
-/** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */
-export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string }
+/** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. `chat` is an ordinary-conversation answer. */
+export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice' | 'chat'; ticketId?: string }
 /** A queued message waits (`pending`), went out (`sent`), or was dropped because its conversation can never receive it (`dropped`). */
 export type ReplyStatus = 'pending' | 'sent' | 'dropped'
 /** The messages queued for Channels; the Engine queues them inside its commands, and a sender delivers them later. */
