@@ -254,13 +254,26 @@ describe('settings migration', () => {
       sources: { feishu: feishuSource({ chats: [{ chatId: CHAT, listen: 'mentions' }, { chatId: OBSERVED, listen: 'all' }], directMessages: false }), github: { enabled: true, config: { pollSeconds: 120 } } },
       policy: { rules: [], sources: { feishu: { allowed: [{ id: MEMBER, name: 'A' }], admission: {} }, github: { allowed: [{ id: 'a' }], admission: {} } } },
       eval: { mode: 'auto', timeoutSeconds: 90, model: { provider: 'p', model: 'm' } },
-      executor: { model: null, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [] },
+      executor: { model: null, maxWorkers: 5, directory: '', generalRoots: [], fleet: { enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000 }, prepare: '', blockedCommands: [] },
     })
     expect(migrateSettings(migrated)).toEqual(migrated)
   })
   it('leaves chats that were observed only while admission was off outside the Feishu Source', () => {
     const migrated = SettingsSchema.parse(migrateSettings({ allowedChats: [CHAT], members: [], admission: { mode: 'off', chats: [OBSERVED] } }))
     expect(migrated.sources.feishu!.config).toEqual({ chats: [{ chatId: CHAT, listen: 'mentions' }], directMessages: true })
+  })
+})
+
+describe('general directory settings', () => {
+  it('defaults the allowlist to empty for old settings', () => {
+    expect(SettingsSchema.parse({ executor: { maxWorkers: 2 } }).executor.generalRoots).toEqual([])
+  })
+  it('accepts absolute roots and rejects every relative or empty entry', () => {
+    expect(SettingsSchema.parse({ executor: { generalRoots: ['/tmp/work', '/Volumes/My Disk/output'] } }).executor.generalRoots)
+      .toEqual(['/tmp/work', '/Volumes/My Disk/output'])
+    for (const root of ['', 'work', './work', '../work', '~/work', '/tmp/\0bad']) {
+      expect(SettingsSchema.safeParse({ executor: { generalRoots: ['/tmp/allowed', root] } }).success).toBe(false)
+    }
   })
 })
 

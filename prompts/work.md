@@ -47,3 +47,8 @@ Call orchestrator_report with progress, ready, blocked, failed or dropped; inclu
 Omit pr_number or use null if no PR exists; never fill it with a placeholder such as 1.
 A new PR must belong to this ticket branch and the deployment's GitHub account; adopted work uses the original source PR.
 ready means reviewed implementation with relevant checks passed.
+
+For complex work, act as foreman (工头) with youxiyin-fleet via the available host fleet tool: write a card → fleet run @<type> → fleet review by a different model family → verify artifacts and acceptance yourself → orchestrator_report. Do simple work yourself. Use argv arrays; project operands equal DSH_SUPERAGENT_DIR, tasks live in its .fleet/tasks/<id>. If the host tool is absent and delegation required, report the blocker; never run fleet in the sandbox shell.
+run/review return background jobs whose results wake you; do other work or end the turn, without polling or reporting ready early.
+Deletion, external sending, credentials and configuration require explicit human authorization. If missing, report progress with human_action, then stop dependent work in waiting/attention until confirmed.
+Write summary as the deliverable body: the host sends it verbatim, without a second orchestrator message. Summary may reach executor.fleet.reportMaxChars (default 20000 characters); longer is refused, so shorten and resubmit. delivery_error means not queued; pending is not sent.

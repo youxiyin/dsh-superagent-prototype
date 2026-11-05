@@ -15,9 +15,12 @@ export class CliError extends Error {
   constructor(message: string, readonly code?: number, readonly exitCode?: number) { super(message) }
 }
 /** Extracts a sanitized error from a failed subprocess without echoing argv, which may contain message text. */
-export function commandError(error: unknown, program = 'command'): Error {
+export function commandError(error: unknown, program = 'command', timeoutMs = TIMEOUT_MS): Error {
   if (error instanceof Error && error.name === 'AbortError') return error
   const exitCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined
+  if (error && typeof error === 'object' && 'killed' in error && error.killed && 'signal' in error && error.signal === 'SIGTERM') {
+    return new CliError(`${basename(program)} ${ended(error, timeoutMs)}`, undefined, exitCode)
+  }
   if (error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string') {
     const stderr = error.stderr.trim()
     let parsed: { error?: { code?: number; message?: string } } | undefined
@@ -28,13 +31,13 @@ export function commandError(error: unknown, program = 'command'): Error {
     // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
     if (stderr) return new CliError(stderr.slice(0, 2000), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode)
   }
-  return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode)
+  return new CliError(`${basename(program)} ${ended(error, timeoutMs)}`, undefined, exitCode)
 }
-function ended(error: unknown): string {
+function ended(error: unknown, timeoutMs: number): string {
   const { killed, signal, code } = (error ?? {}) as { killed?: boolean; signal?: string | null; code?: unknown }
   if (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return 'printed more output than it may'
   // `execFile` timeout terminates the process with SIGTERM and sets `killed: true`.
-  if (killed && signal === 'SIGTERM') return `timed out after ${TIMEOUT_MS / 1000} s`
+  if (killed && signal === 'SIGTERM') return `timed out after ${timeoutMs / 1000} s`
   if (signal) return `was stopped by ${signal}`
   if (typeof code === 'number') return `exited with code ${code}`
   return typeof code === 'string' ? `could not run: ${code}` : 'failed'
@@ -65,12 +68,12 @@ export class Commands {
   get deployment(): Deployment { return this.resolved() }
   get repository(): string { return this.deployment.repository }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
-  async run(program: string, args: string[], cwd?: string): Promise<string> {
+  async run(program: string, args: string[], cwd?: string, timeoutMs = TIMEOUT_MS): Promise<string> {
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024,
         env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
       return stdout
-    } catch (error) { throw commandError(error, program) }
+    } catch (error) { throw commandError(error, program, timeoutMs) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
   async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }

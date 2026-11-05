@@ -4,6 +4,7 @@
  */
 import { LIMITS } from './limits.ts'
 import { z } from 'zod'
+import { isAbsolute } from 'node:path'
 import { ADMISSION_DEFAULTS, type Admission, type AdmissionCell, type AdmissionRow } from './admission.ts'
 import { key, type AssessmentOutcome, type Mandate, type Policy, type PolicyEffect, type SourceScope, type Strength, type Thread, type Ticket,
   type Trigger, type ActorRef, type GateResult } from './core/index.ts'
@@ -88,10 +89,18 @@ export const EvalConfigSchema = z.object({
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
 /** Executor settings: worker model, concurrency, ticket directory root (empty defaults to `<stateDir>/work`), `prepare` command, and blocked commands. */
+export const AbsoluteDirectorySchema = z.string().refine(path => isAbsolute(path) && !path.includes('\0'), 'An absolute directory path is required')
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
+  generalRoots: z.array(AbsoluteDirectorySchema).default([]),
+  fleet: z.object({
+    enabled: z.boolean().default(false),
+    bin: z.string().trim().min(1).refine(value => !value.includes("\0"), 'Invalid executable').default('fleet'),
+    timeoutMinutes: z.number().int().min(1).max(600).default(180),
+    reportMaxChars: z.number().int().min(1000).max(100000).default(20000),
+  }).strict().default(() => ({ enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000 })),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
 }).strict()

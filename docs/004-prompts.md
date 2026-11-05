@@ -56,6 +56,8 @@ The system prompt is assembled in this order:
 
 Admission instructions come from `prompts/admission.md`. They describe proactive assessment and when an irrelevant candidate can be ignored from its card. `orchestrator_eval` returns context rather than repeating these instructions.
 
+A general-assistant Session answers ordinary conversation and non-repository requests for the main Session and Feishu. It reads `prompts/assistant.md` instead of the shared, role, team, handoff and Policy sections, so it is not a team-editable part; it gets the profile's work tools without the ones that ask a person, change the profile, start goals, message other Sessions or edit documents, and works in the machine's `assistantDir`.
+
 The environment section gives the main Session deployment-wide values and each Executor its Ticket-specific values. The Policy section is regenerated from settings on every model request. It contains the Policy version, accept mode, the explicit-request exemption, and enabled rules as `- <name> (<id>): <instruction>`, or a statement that none is enabled. It is last so a Policy change leaves the preceding prompt text unchanged.
 
 Executors also read DeepSeek Harness's coding prompt and the repository's `AGENTS.md`; the main Session does not. An inferred Ticket adds a final note limiting its Executor to the matched rules. Assignments and incoming messages arrive inline as Trigger cards, with resource pointers only for truncated content.
