@@ -305,6 +305,18 @@ describe('verdict gate and exit-code fidelity', () => {
     expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'verdicted', verdict: 'rework' })
   })
 
+  it('refuses every non-pass verdict on a delegation that already carries a verdict', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { state: 'verdicted', verdict: 'pass' })
+    const before = JSON.stringify(h.runtime.store.tickets.get(ticket.id)?.delegations)
+    for (const verdict of ['rework', 'escalate', 'close']) {
+      const run = vi.mocked(Commands.prototype.run); run.mockClear()
+      await expect(call(['verdict', task, verdict])).rejects.toThrow(/该状态不能记录裁定/)
+      expect(run).not.toHaveBeenCalled()
+      expect(JSON.stringify(h.runtime.store.tickets.get(ticket.id)?.delegations)).toBe(before)
+    }
+  })
+
   it('keeps the fleet exit code from the original CliError before it is stringified', async () => {
     const { call, task, ticket } = await worker()
     vi.mocked(Commands.prototype.run).mockImplementation(async () => {

@@ -182,6 +182,9 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
         if (args[2] === 'pass' && (existing.state !== 'reviewed' || !existing.critic.family || existing.critic.family === existing.producer.family)) {
           throw new Error(`A pass requires a completed foreign-family review (异族评审尚未完成，不能裁定通过): ${id}`)
         }
+        if (args[2] !== 'pass' && !['reported', 'reviewed', 'failed'].includes(existing.state)) {
+          throw new Error(`A ${args[2]} verdict needs a delegation that reported, was reviewed, or failed (该状态不能记录裁定): ${id}`)
+        }
       }
       if (args[0] !== 'run' && args[0] !== 'review') {
         const stdout = await host.commands.withSignal(signal).run(config.bin, finalArgs, directory)

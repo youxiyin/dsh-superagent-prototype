@@ -337,7 +337,7 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 | `:14-19` flag 表 | `review` 增加 `--producer-family`（宿主专用）；`--critic` 与 `--producer-family` 同时标为**宿主专用** |
 | `:22-65` `fleetArgv` | ① `run` 的工人位只接受 `@<链类型>`；② 新增 `card` 标题必填校验；③ **剥离**模型传入的 `--critic` / `--producer-family`，不与宿主填入的值共存；④ 保持现有 realpath / 符号链接 / 操作数校验不变 |
 | `:72` 工具描述 | 改为"填任务类型（@code/@complex/…），不填工人名；评审者由宿主按 fleet 证据安排" |
-| `:74-89` `execute` | ① `run` / `review` 派工时先在事务内写下 `running` / `reviewing` 占位再启动后台 job，结束后按本次派工自己的 `meta.json` 写终态（生产者身份、评审者、`error_class`）；② 发起 `review` 前用 `fleet critics --producer-family <F>` 做前置检查（工作目录为工单目录），通过后注入 `--critic @review`（§6.3）；③ 派工前执行 §7.4 的拒绝闸，含拒绝重复 slug；④ 对 `ready` 报告的拦截不在此文件，见 §8.4；⑤ `verdict` 在调用 fleet 裁定命令**之前**读该 slug 的委派记录做判定点（在飞拒绝，`pass` 必须已有完成的异族评审），拒绝时不调用命令也不写记录；⑥ 退出码捕获点在传给 `startBackgroundJob` 的后台执行函数**内部**：在原始错误被 `String(error)` 之前读取 `CliError.exitCode`，放进闭包变量供终态记 `fleet-exit-N` |
+| `:74-89` `execute` | ① `run` / `review` 派工时先在事务内写下 `running` / `reviewing` 占位再启动后台 job，结束后按本次派工自己的 `meta.json` 写终态（生产者身份、评审者、`error_class`）；② 发起 `review` 前用 `fleet critics --producer-family <F>` 做前置检查（工作目录为工单目录），通过后注入 `--critic @review`（§6.3）；③ 派工前执行 §7.4 的拒绝闸，含拒绝重复 slug；④ 对 `ready` 报告的拦截不在此文件，见 §8.4；⑤ `verdict` 在调用 fleet 裁定命令**之前**读该 slug 的委派记录做判定点（在飞拒绝，`pass` 必须已有完成的异族评审，`rework` / `escalate` / `close` 只在 `reported` / `reviewed` / `failed` 状态记录），拒绝时不调用命令也不写记录；⑥ 退出码捕获点在传给 `startBackgroundJob` 的后台执行函数**内部**：在原始错误被 `String(error)` 之前读取 `CliError.exitCode`，放进闭包变量供终态记 `fleet-exit-N` |
 | `:68-69` | 注册条件不变（`executor.fleet.enabled`） |
 
 **P0 阶段宿主只剥离 `--producer-family`，不注入它。** 生产者族永远来自 builder run 的 `meta.json`，注入路径没有输入；等 Executor 真的要自产可评审产物时（P1）再打开注入。
