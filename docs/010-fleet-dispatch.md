@@ -312,7 +312,7 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 
 `run` 的后台 job 结束（`fleet_result` 唤醒）后，宿主读 run 目录的 `meta.json`，取得实际工人身份、family、状态与 `error_class`，写入 `delegation.producer`。这一步是 §6.1 的唯一数据来源。
 
-**只认本次派工自己产生的 run 目录**：宿主要在派工时快照 `<taskDir>/runs/` 下已有的目录名，完成时从 stdout 取候选目录，再用真实路径确认它位于 `<taskDir>/runs/` 且不在快照里；拿不到这样的目录时不得回落到最新历史 run，记 `missing-run-dir`（stdout 无目录）或 `unattributed-run`（目录不属于本次派工），且不写任何历史身份。评审失败时委派回到 `reported`，`critic` 保持空，`reviewRounds` 只对归属成立的尝试加一。
+**只认本次派工自己产生的 run 目录**：宿主要在派工时快照 `<taskDir>/runs/` 的**直接子目录名**，完成时从 stdout 取候选目录，再按真实路径确认它是 `<taskDir>/runs/` 的**直接子目录**（`dirname(realRun) === realpath(<taskDir>/runs)`）且不在快照里；嵌套的历史目录（如 `runs/old/cached`）一律不算。判定成功后返回**已核验的真实路径**，不返回调用方传入的原始字符串。拿不到这样的目录时不得回落到最新历史 run，记 `missing-run-dir`（stdout 无目录）或 `unattributed-run`（目录不属于本次派工），且不写任何历史身份。评审失败时委派回到 `reported`，`critic` 保持空，`reviewRounds` 只对归属成立的尝试加一。
 
 **判定完成的依据是 meta 的终态 + `report.md` 是本次新写的**，不是 `job_id` 处于 running。fleet 已实现"旧回执判 `missing-report`"的防静默失败（SKILL.md:62、88）。命令非零退出会丢 stdout，此时只能按 fleet 退出码记 `fleet-exit-N`（取不到记 `unknown`），不得把历史 run 当成本次结果。
 
@@ -327,6 +327,8 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 - 卡片要求免费档，但 `executor.fleet.allowFree` 为假，或工单的材料敏感度高于允许级别（§10.2）。
 - **在飞委派不可裁定**：`verdict` 发现该 slug 的委派处于 `running` / `reviewing` 时直接拒绝，不调用 fleet 裁定命令、不写任何记录；`rework` / `escalate` / `close` 只能在 `reported` / `reviewed` / `failed` 状态下记录。
 - **`pass` 必须以已完成的异族评审为前提**：只有 `state === 'reviewed'`、`critic.family` 非空且与 `producer.family` 不同才允许；不满足时同样拒绝且不调用命令、不写记录，消息与 ready 闸门各条可区分。
+- **同一委派不得重复发起评审**：只有 `state === 'reported'` 允许 `review`；`running` / `reviewing` / `reviewed` / `verdicted` / `failed` 各自给出互不相同、可关键词检索的拒绝消息。拒绝时不调用 `fleet critics`、不启动 fleet 命令、不写 `reviewing` 占位、不启动后台 job。状态在写占位的同一事务内重查一次（防 TOCTOU）。
+- **评审轮数上限在宿主侧生效**：`review` 先取该 slug 委派记录的最新 `reviewRounds`，`>= executor.fleet.reviewRounds` 即拒绝，消息含已用轮数与上限（形如 `3/3`）、「评审轮数已用尽」以及改报 `escalate` 交人工的提示。该检查先于 `fleet critics`，轮数用尽时不花子进程。
 
 ## 8. 组件级改动规格
 
@@ -337,7 +339,7 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 | `:14-19` flag 表 | `review` 增加 `--producer-family`（宿主专用）；`--critic` 与 `--producer-family` 同时标为**宿主专用** |
 | `:22-65` `fleetArgv` | ① `run` 的工人位只接受 `@<链类型>`；② 新增 `card` 标题必填校验；③ **剥离**模型传入的 `--critic` / `--producer-family`，不与宿主填入的值共存；④ 保持现有 realpath / 符号链接 / 操作数校验不变 |
 | `:72` 工具描述 | 改为"填任务类型（@code/@complex/…），不填工人名；评审者由宿主按 fleet 证据安排" |
-| `:74-89` `execute` | ① `run` / `review` 派工时先在事务内写下 `running` / `reviewing` 占位再启动后台 job，结束后按本次派工自己的 `meta.json` 写终态（生产者身份、评审者、`error_class`）；② 发起 `review` 前用 `fleet critics --producer-family <F>` 做前置检查（工作目录为工单目录），通过后注入 `--critic @review`（§6.3）；③ 派工前执行 §7.4 的拒绝闸，含拒绝重复 slug；④ 对 `ready` 报告的拦截不在此文件，见 §8.4；⑤ `verdict` 在调用 fleet 裁定命令**之前**读该 slug 的委派记录做判定点（在飞拒绝，`pass` 必须已有完成的异族评审，`rework` / `escalate` / `close` 只在 `reported` / `reviewed` / `failed` 状态记录），拒绝时不调用命令也不写记录；⑥ 退出码捕获点在传给 `startBackgroundJob` 的后台执行函数**内部**：在原始错误被 `String(error)` 之前读取 `CliError.exitCode`，放进闭包变量供终态记 `fleet-exit-N` |
+| `:74-89` `execute` | ① `run` / `review` 派工时先在事务内写下 `running` / `reviewing` 占位再启动后台 job，结束后按本次派工自己的 `meta.json` 写终态（生产者身份、评审者、`error_class`）；② 发起 `review` 前用 `fleet critics --producer-family <F>` 做前置检查（工作目录为工单目录），通过后注入 `--critic @review`（§6.3）；③ 派工前执行 §7.4 的拒绝闸，含拒绝重复 slug；④ 对 `ready` 报告的拦截不在此文件，见 §8.4；⑤ `verdict` 在调用 fleet 裁定命令**之前**读该 slug 的委派记录做判定点（在飞拒绝，`pass` 必须已有完成的异族评审，`rework` / `escalate` / `close` 只在 `reported` / `reviewed` / `failed` 状态记录），拒绝时不调用命令也不写记录；⑥ 退出码捕获点在传给 `startBackgroundJob` 的后台执行函数**内部**：在原始错误被 `String(error)` 之前读取 `CliError.exitCode`，放进闭包变量供终态记 `fleet-exit-N`；⑦ `review` 先查该 slug 最新记录的 `reviewRounds`（`>= executor.fleet.reviewRounds` 即拒绝，含已用/上限与 escalate 提示），再要求 `state === 'reported'`；写 `reviewing` 占位的同一事务内重查状态与轮数（防 TOCTOU）；⑧ 写 `reviewing` 占位的同一事务内先清空上一轮遗留的 `reviewJobId`（失败重试时旧 ID 仍在，否则新 job 绑不上、其回调会被身份守卫拦下）；后台 job 拿到 `jobId` 后在**同一同步段内**（中间无 `await`）于事务内把 `reviewJobId` 写成该 jobId，条件是记录仍为 `reviewing` 且 `reviewJobId` 为空；完成回调推进状态前核对记录当前 `reviewJobId === wakeId`，不相等则只唤醒 Session，不改 `state` / `critic` / `reviewRounds` / `errorClass`（该守卫只作用于 review 分支） |
 | `:68-69` | 注册条件不变（`executor.fleet.enabled`） |
 
 **P0 阶段宿主只剥离 `--producer-family`，不注入它。** 生产者族永远来自 builder run 的 `meta.json`，注入路径没有输入；等 Executor 真的要自产可评审产物时（P1）再打开注入。
@@ -370,13 +372,17 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 
 ### 8.4 `src/app/tools/executor.ts`
 
-`orchestrator_report`（`:77-80`）在 `state === 'ready'` 时增加前置校验：
+`orchestrator_report`（`:77-80`）在 `state === 'ready'` 时对该 Ticket 的**全部委派**求值，判定顺序固定如下：
 
-- 该 Ticket 存在 delegation 且其 `state` 为 `running` / `reviewing`（在飞）→ 拒绝，说明"委派尚未完成"。
-- 该 Ticket 存在 delegation 且 `verdict` 不为 `pass` → 拒绝，错误信息说明"委派尚未通过异族评审"。
-- 该 Ticket 存在 delegation 且 `verdict === 'rework'` → 拒绝，提示"评审要求返工"。
-- 该 Ticket 存在 delegation 但 `reviewRounds` 已用尽且未裁定 → 拒绝，提示"评审轮数已用尽"。
-- 该 Ticket 最后一条 delegation 的 `critic.family` 为空，或与 `producer.family` 相同 → 拒绝，说明"评审者身份必须是异族"（即使 `verdict === 'pass'` 也不放行）。
+1. **任一**委派 `state` 为 `running` / `reviewing`（在飞）→ 拒绝，消息含「委派尚未完成」。
+2. **末条**委派 `verdict === 'rework'` → 拒绝，消息含「评审要求返工」。
+3. **任一**委派未裁定且未失败（`state` 为 `reported` / `reviewed` 且 `verdict` 为空）：`reviewRounds >= executor.fleet.reviewRounds` → 拒绝，消息含「评审轮数已用尽」；否则拒绝，消息含「委派尚未通过异族评审」。
+4. **末条**委派必须 `state === 'verdicted'` 且 `verdict === 'pass'`，否则拒绝：`verdict` 为 `escalate` / `close` 时消息点明裁定值并说明「只有 pass 允许 ready」；`state === 'failed'` 时消息说明「最后一次委派失败，没有通过评审的产出」。这些消息与第 1、2、3、5 条可区分。
+5. **末条**委派 `critic.family` 为空，或与 `producer.family` 相同 → 拒绝，消息含「评审者必须来自异族」（即使 `verdict === 'pass'` 也不放行）。
+
+**取代规则**：末条之前的委派，若 `state === 'verdicted'`（pass / rework / escalate / close 任一）或 `state === 'failed'`，视为已被取代，不再阻断 ready；若仍是 `reported` / `reviewed`，仍按第 3 条阻断。没有委派时照旧放行。
+
+这样定的理由：`fleet.ts` 的开闸规则（`:154`）已把「已裁定 / 已失败」的委派视为关闭（只有 `state !== 'verdicted' && state !== 'failed'` 才算未关闭）。若 ready 闸门要求所有历史委派都 `pass`，任何一次返工之后 ready 将永远不可达。返工的正常路径是：评审要求返工 → 裁定 `rework` → 换新卡重派 → 新委派通过异族评审并 `pass` → ready。
 
 其他 report 状态（progress / blocked / failed / dropped）不受影响。
 
@@ -395,13 +401,16 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 - "write a card → `fleet run @<type>`" 保留，但补一句"`@<type>` 取自 code / complex / bulk / survey / zh-text / visual；不要指名工人，宿主会按 fleet 的健康证据选"。
 - "fleet review by a different model family" 从工头职责改为**宿主职责**：工头写卡时不写生产者身份；工头不选评审者。
 - 删除任何让工头自行 bash 调用 fleet 的暗示；明确"fleet 只能通过**宿主提供的 fleet 工具**调用，绝不用 shell"。
-- 新增一句工头的红线："**你不写实现代码**。所有代码改动由 fleet 工人完成；你负责拆卡、核验产物、裁定与报告。"
+- 工头红线**以宿主 fleet 工具是否在工具清单里为前提**，提示词写明两档：
+  - 工具可用（工头模式）：所有实现代码改动由 fleet 工人完成；**你不写实现代码**，只做只读调查、核验产物、裁定与报告。
+  - 工具不可用（未启用 fleet 的部署）：保留既有能力——小型本地编码工单由你自行完成调查、实现、检查、自检、提交、推送与开 PR；复杂工单报告阻塞。
+- **不得**留下「简单活自己做」这类无条件授权句；工头模式下的自行完成范围只限只读调查、核验与报告。
 
 **提示词里不写工具的字面名 `orchestrator_fleet`。** 该工具只在 `executor.fleet.enabled` 为真时才注册（`fleetTools` 在关闭时返回空数组），而提示词是静态文本；写它的字面名会违反"提示词只提到已注册工具"的模型表面不变量——`tests/model-surface.spec.ts` 会以 `orchestrator_fleet is not a tool` 判失败。提示词用"the host fleet tool"指代它（改写前的既有措辞），模型从工具清单里认得出；工具的名字与描述由工具自身承担。**这条约束同时适用于 `src/app/tools/fleet.ts` 的工具描述改动（§8.1）：描述文本只在工具已注册时才进入模型表面。**
 
 这段文本同时是**可被团队编辑的**。因此 §8.1–§8.4 的代码闸是真正的强制点，prompt 只是协作说明。
 
-**这段契约把 worker 的提示词预算用尽，因此有意抬预算。** 新增约 260 个字符（worker 的 prompt + tools 从 40_244 涨到 40_502），越过了 `tests/model-surface.spec.ts` 的 `BUDGET.worker`（40_500）。该常量的注释写明"raise it only intentionally and explain why in the commit message"，所以 P0 把它提到 **40_800** 并在注释里写明原因——这是有意抬高上限，不是绕过门禁。
+**这段契约接近 worker 的提示词预算。** P0 为容纳最初的工头契约把 `tests/model-surface.spec.ts` 的 `BUDGET.worker` 从 40_500 提到 **40_800**。返工后的两档措辞必须装在这一上限内，**不得再上调**；净增长靠压缩同段其它句子消化。
 
 ### 8.8 面板（对应 [005 Panel](005-panel.md)）
 
@@ -436,7 +445,7 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 ### 10.1 每工单预算
 
 - `executor.fleet.delegationsPerTicket`（默认 2）限制一个工单能开几次委派。
-- `executor.fleet.reviewRounds`（默认 3）与 fleet 卡上的"评审轮数上限"一致；超出后宿主不再自动发起评审，改为报告 `escalate` 交人工。
+- `executor.fleet.reviewRounds`（默认 3）与 fleet 卡上的"评审轮数上限"一致；超出后宿主不再自动发起评审，改为报告 `escalate` 交人工。宿主在 `review` 前读该委派最新 `reviewRounds`，达到上限即拒绝，且该检查先于 `fleet critics`，不为其花子进程。
 - fleet 卡片自带预算节（任务类型 / 材料敏感度 / 质量级别 / 评审轮数上限等），宿主写卡时必须填写，否则 `run` 被拒（fleet 退出码 2）。
 - **大卡要自己拆。** fleet 在 `run` 启动前会检查目标节条目（超过 3 条）或预算节时间上限（超过 60 分钟），在 stdout 提示"建议拆成阶段卡"，但只提示、不拦截（SKILL.md:46）。工头读到这条提示时的动作是**按阶段拆卡重新写卡**，而不是无视它继续跑一张大卡——工头拿到的阶段划分才是"worker 内部有分工"的实际载体。宿主把该 stdout 提示落到 `Delegation.note`，让面板能看见"这张卡 fleet 认为偏大"。
 

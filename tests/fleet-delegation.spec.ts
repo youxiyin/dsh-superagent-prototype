@@ -1,5 +1,5 @@
 /** Fleet delegation evidence: run meta, run directories, critic candidates, argv tightening and host options. */
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -69,10 +69,26 @@ describe('run outcome and critic evidence', () => {
     mkdirSync(fresh, { recursive: true }); mkdirSync(stale, { recursive: true })
     const known = new Set(['20261105-230000-codex-builder'])
     expect(knownRunDirs(root)).toEqual(new Set(['20261106-101010-kimi-k3-1-pro-builder', '20261105-230000-codex-builder']))
-    expect(attributeRunDir(root, fresh, known)).toBe(fresh)
+    expect(attributeRunDir(root, fresh, known)).toBe(realpathSync(fresh))
     expect(attributeRunDir(root, stale, known)).toBeUndefined()
     expect(attributeRunDir(root, outside, known)).toBeUndefined()
     expect(attributeRunDir(root, undefined, known)).toBeUndefined()
+  })
+
+  it('accepts only a fresh direct child of runs and returns its verified real path', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-nested-'))
+    const runs = join(root, 'runs'), old = join(runs, 'old'), nested = join(old, 'cached')
+    const fresh = join(runs, '20261106-120000-codex-builder')
+    mkdirSync(nested, { recursive: true })
+    const known = new Set(['old'])
+    // A nested historical directory is not a direct child of runs.
+    expect(attributeRunDir(root, nested, known)).toBeUndefined()
+    mkdirSync(fresh, { recursive: true })
+    expect(attributeRunDir(root, fresh, known)).toBe(realpathSync(fresh))
+    // A direct child already in the dispatch-time snapshot was not produced by this dispatch.
+    expect(attributeRunDir(root, old, known)).toBeUndefined()
+    expect(attributeRunDir(root, undefined, known)).toBeUndefined()
+    expect(attributeRunDir(root, join(runs, 'absent'), known)).toBeUndefined()
   })
 
   it('takes the last existing run directory from a run result line', () => {

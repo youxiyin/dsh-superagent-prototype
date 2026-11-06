@@ -124,6 +124,18 @@ function incompleteClass(outcome: RunOutcome): string {
   return 'incomplete-run'
 }
 
+/** Why a delegation in this state cannot start a review; each state has its own searchable message. */
+function reviewStateError(state: Delegation['state'], id: string): Error {
+  switch (state) {
+    case 'running': return new Error(`The delegation is still running; wait for it to finish before reviewing (委派尚未完成): ${id}`)
+    case 'reviewing': return new Error(`A review is already in flight; do not start a second review (评审已在飞，不得重复发起评审): ${id}`)
+    case 'reviewed': return new Error(`This delegation was already reviewed and waits for a verdict (已评审，等待裁定): ${id}`)
+    case 'verdicted': return new Error(`This delegation already has a verdict; start a new card to delegate again (已裁定，要重派请换一张新卡): ${id}`)
+    case 'failed': return new Error(`This delegation failed and has no output to review (该委派失败，没有可评审的产出): ${id}`)
+    default: return new Error(`This delegation is not reviewable in state ${state} (该状态不能发起评审): ${id}`)
+  }
+}
+
 /** Register only when enabled. Recheck the live switch and directory on every invocation. */
 export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'commands'>,
   sessions: Pick<Sessions, 'prompt'>, ticket: Ticket, atomic: <T>(work: () => T) => T): Tool[] {
@@ -166,6 +178,11 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
       if (args[0] === 'review') {
         const existing = current.delegations?.find(item => item.id === id)
         if (!existing) throw new Error(`There is no delegation to review yet (还没有可评审的委派记录): ${id}`)
+        // Spend no subprocess on critics once the host-side round budget is used up.
+        if (existing.reviewRounds >= config.reviewRounds) {
+          throw new Error(`Review rounds exhausted (评审轮数已用尽): ${existing.reviewRounds}/${config.reviewRounds}; report escalate to a person (交人工 / escalate) instead of starting another review`)
+        }
+        if (existing.state !== 'reported') throw reviewStateError(existing.state, id)
         const producerFamily = existing.producer?.family ?? ''
         if (!producerFamily) throw new Error(`The producer family is unknown; cannot arrange a foreign-family review (生产族未知): ${id}`)
         await readCriticCandidates(config.bin, producerFamily, directory,
@@ -216,7 +233,14 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
           const latest = host.store.tickets.get(ticket.id)
           const existing = latest?.delegations?.find(item => item.id === id)
           if (!existing) throw new Error(`There is no delegation to review yet (还没有可评审的委派记录): ${id}`)
-          recordDelegation(host, ticket.id, { ...existing, state: 'reviewing' })
+          // Re-read the record in the placeholder transaction: a concurrent review may have claimed it since the precheck.
+          if (existing.reviewRounds >= config.reviewRounds) {
+            throw new Error(`Review rounds exhausted (评审轮数已用尽): ${existing.reviewRounds}/${config.reviewRounds}; report escalate to a person (交人工 / escalate) instead of starting another review`)
+          }
+          if (existing.state !== 'reported') throw reviewStateError(existing.state, id)
+          // Clear the previous attempt's job id here: the retry owns the record now, and the binding below only
+          // writes into an empty slot, so a stale id would leave the new job unbound and its callback rejected.
+          recordDelegation(host, ticket.id, { ...existing, state: 'reviewing', reviewJobId: '' })
         })
       }
       // Capture the fleet exit code from the original error here, before startBackgroundJob stringifies it.
@@ -261,6 +285,8 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
                   ...(note ? { note } : {}), startedAt: previous?.startedAt ?? startedAt, endedAt: iso(),
                 })
               } else {
+                // Only the job that owns this record may advance it; a superseded callback still wakes the worker below.
+                if (!previous || previous.reviewJobId !== wakeId) return
                 const producerFamily = previous?.producer?.family ?? ''
                 const attributed = outcome !== undefined
                 // Every attributed review attempt uses one round, whether it passes or not; an unattributed one uses none.
@@ -294,6 +320,16 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
           if (existing) recordDelegation(host, ticket.id, { ...existing, state: 'failed', errorClass: exitClass(error, exitCode), endedAt: iso() })
         })
         throw error
+      }
+      // Bind the review to its job here, synchronously: no wait may separate the job start from this write.
+      if (args[0] === 'review') {
+        atomic(() => {
+          const latest = host.store.tickets.get(ticket.id)
+          const existing = latest?.delegations?.find(item => item.id === id)
+          if (existing && existing.state === 'reviewing' && !existing.reviewJobId) {
+            recordDelegation(host, ticket.id, { ...existing, reviewJobId: jobId })
+          }
+        })
       }
       return { job_id: jobId, status: 'running' }
     },

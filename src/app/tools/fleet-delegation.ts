@@ -1,6 +1,6 @@
 /** Read a fleet run's meta, parse critic evidence, and record a delegation on its Ticket. */
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { basename, join, sep } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { Delegation, Ticket } from '../../core/model.ts'
 
 /** What a run's `meta.json` says about the actual worker, and whether this run wrote a fresh report. */
@@ -61,8 +61,9 @@ export function readRunOutcome(taskDir: string, runDir?: string): RunOutcome {
 }
 
 /**
- * Attribute a run directory to this dispatch: it must lie under `<taskDir>/runs/` by real path and its name must not
- * have existed in the dispatch-time snapshot. Anything else is not this dispatch's own run.
+ * Attribute a run directory to this dispatch: by real path it must be a direct child of `<taskDir>/runs/`, and its name
+ * must not have existed in the dispatch-time snapshot. Anything else, including a nested historical directory such as
+ * `runs/old/cached`, is not this dispatch's own run. Returns the verified real path, not the caller's raw string.
  */
 export function attributeRunDir(taskDir: string, runDir: string | undefined, known: ReadonlySet<string>): string | undefined {
   if (!runDir) return undefined
@@ -71,10 +72,10 @@ export function attributeRunDir(taskDir: string, runDir: string | undefined, kno
     runsRoot = realpathSync(join(realpathSync(taskDir), 'runs'))
     realRun = realpathSync(runDir)
   } catch { return undefined }
-  if (!realRun.startsWith(runsRoot + sep)) return undefined
+  if (dirname(realRun) !== runsRoot) return undefined
   if (!statSync(realRun).isDirectory()) return undefined
   if (known.has(basename(realRun))) return undefined
-  return runDir
+  return realRun
 }
 
 /** The run directory named by the last result line of `fleet run`'s stdout, when that directory exists. */
