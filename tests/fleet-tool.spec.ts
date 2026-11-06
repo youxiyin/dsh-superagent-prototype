@@ -262,6 +262,133 @@ describe('delegation placeholders, attribution and review prechecks', () => {
     })
     expect(Commands.prototype.run).toHaveBeenCalledWith('fleet', ['critics', '--producer-family', 'moonshot'], directory)
   })
+
+  it('refuses a review at the round cap without a command or any record change', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { reviewRounds: h.runtime.store.settings().executor.fleet.reviewRounds })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['review', task])).rejects.toThrow(/评审轮数已用尽/)
+    expect(run).not.toHaveBeenCalled()
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'reported', reviewRounds: 3 })
+    expect(runningJobs(h.ctx, `worker-${ticket.id}`)).toEqual([])
+  })
+
+  it('binds the review record to its job and refuses a concurrent second review', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id)
+    const pending = Promise.withResolvers<string>()
+    vi.mocked(Commands.prototype.run).mockImplementation(async (_bin, args) =>
+      args[0] === 'critics' ? '评审证据（生产族 moonshot）：\ncodex｜family=gpt｜pool=p｜critic自检=ok' : pending.promise)
+    const first = await call(['review', task])
+    expect(first).toMatchObject({ status: 'running' })
+    const record = () => h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)
+    expect(record()).toMatchObject({ state: 'reviewing', reviewJobId: first.job_id })
+    await expect(call(['review', task])).rejects.toThrow(/评审已在飞|不得重复/)
+    expect(record()).toMatchObject({ state: 'reviewing', reviewJobId: first.job_id })
+    const runDir = join(task, 'runs', '20261106-120000-codex-critic'); mkdirSync(runDir, { recursive: true })
+    writeFileSync(join(runDir, 'meta.json'), JSON.stringify({ status: 'done', worker: 'codex', family: 'gpt', role: 'critic', report_exists: true }))
+    pending.resolve(`done｜1.00 秒｜report.md 有｜${runDir}`)
+    await vi.waitFor(() => expect(record()?.state).toBe('reviewed'))
+    expect(record()).toMatchObject({ critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1 })
+  })
+
+  it('retries a failed review and binds the retry to its own job', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id)
+    const retry = Promise.withResolvers<string>()
+    let reviews = 0
+    vi.mocked(Commands.prototype.run).mockImplementation(async (_bin, args) => {
+      if (args[0] === 'critics') return '评审证据（生产族 moonshot）：\ncodex｜family=gpt｜pool=p｜critic自检=ok'
+      reviews += 1
+      if (reviews === 1) throw new Error('fleet exited with code 4')
+      return retry.promise
+    })
+    const record = () => h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)
+    await call(['review', task])
+    expect(record()).toMatchObject({ state: 'reviewing' })
+    // The failed attempt returns the delegation to reported and keeps the job id it ran under.
+    await vi.waitFor(() => expect(record()?.state).toBe('reported'))
+    expect(record()).toMatchObject({ errorClass: 'fleet-exit-4', reviewRounds: 0 })
+    try {
+      const second = await call(['review', task])
+      // The retry owns the record: its own job id replaces the stale one.
+      expect(second).toMatchObject({ status: 'running' })
+      expect(record()).toMatchObject({ state: 'reviewing', reviewJobId: second.job_id })
+      const runDir = join(task, 'runs', '20261106-120200-codex-critic'); mkdirSync(runDir, { recursive: true })
+      writeFileSync(join(runDir, 'meta.json'), JSON.stringify({ status: 'done', worker: 'codex', family: 'gpt', role: 'critic', report_exists: true }))
+      retry.resolve(`done｜1.00 秒｜report.md 有｜${runDir}`)
+      await vi.waitFor(() => expect(record()?.state).toBe('reviewed'))
+      expect(record()).toMatchObject({ critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1 })
+    } finally {
+      // Let a still-running background job settle, so a failed assertion does not hang the teardown.
+      retry.resolve('failed｜1.00 秒｜report.md 无｜')
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  })
+
+  it('spends a round on an attributed review failure and keeps the retry on its own job', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id)
+    const retry = Promise.withResolvers<string>()
+    let reviews = 0
+    vi.mocked(Commands.prototype.run).mockImplementation(async (_bin, args) => {
+      if (args[0] === 'critics') return '评审证据（生产族 moonshot）：\ncodex｜family=gpt｜pool=p｜critic自检=ok'
+      reviews += 1
+      if (reviews === 1) {
+        // The critic ran in the producer's own family: the attempt is attributed, so it spends a round.
+        const dir = join(task, 'runs', '20261106-120300-kimi-critic'); mkdirSync(dir, { recursive: true })
+        writeFileSync(join(dir, 'meta.json'), JSON.stringify({ status: 'done', worker: 'kimi-k3-1-pro', family: 'moonshot', role: 'critic', report_exists: true }))
+        return `failed｜1.00 秒｜report.md 有｜${dir}`
+      }
+      return retry.promise
+    })
+    const record = () => h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)
+    await call(['review', task])
+    await vi.waitFor(() => expect(record()?.state).toBe('reported'))
+    expect(record()).toMatchObject({ errorClass: 'same-family', reviewRounds: 1, critic: { worker: '', family: '' } })
+    try {
+      const second = await call(['review', task])
+      // The retry owns the record: its own job id replaces the stale one.
+      expect(second).toMatchObject({ status: 'running' })
+      expect(record()).toMatchObject({ state: 'reviewing', reviewJobId: second.job_id, reviewRounds: 1 })
+      const runDir = join(task, 'runs', '20261106-120400-codex-critic'); mkdirSync(runDir, { recursive: true })
+      writeFileSync(join(runDir, 'meta.json'), JSON.stringify({ status: 'done', worker: 'codex', family: 'gpt', role: 'critic', report_exists: true }))
+      retry.resolve(`done｜1.00 秒｜report.md 有｜${runDir}`)
+      await vi.waitFor(() => expect(record()?.state).toBe('reviewed'))
+      expect(record()).toMatchObject({ critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 2 })
+    } finally {
+      // Let a still-running background job settle, so a failed assertion does not hang the teardown.
+      retry.resolve('failed｜1.00 秒｜report.md 无｜')
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  })
+
+  it('does not let a superseded review callback advance a record owned by a newer job', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id)
+    const first = Promise.withResolvers<string>(), second = Promise.withResolvers<string>()
+    let reviews = 0
+    vi.mocked(Commands.prototype.run).mockImplementation(async (_bin, args) => {
+      if (args[0] === 'critics') return '评审证据（生产族 moonshot）：\ncodex｜family=gpt｜pool=p｜critic自检=ok'
+      reviews += 1
+      return reviews === 1 ? first.promise : second.promise
+    })
+    const one = await call(['review', task])
+    const current = h.runtime.store.tickets.get(ticket.id)!
+    h.runtime.store.tickets.save({ ...current, delegations: [{ ...current.delegations![0]!, state: 'reported', reviewJobId: '' }] })
+    const two = await call(['review', task])
+    const record = () => h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)
+    expect(record()).toMatchObject({ state: 'reviewing', reviewJobId: two.job_id })
+    const runDir = join(task, 'runs', '20261106-120100-codex-critic'); mkdirSync(runDir, { recursive: true })
+    writeFileSync(join(runDir, 'meta.json'), JSON.stringify({ status: 'done', worker: 'codex', family: 'gpt', role: 'critic', report_exists: true }))
+    first.resolve(`done｜1.00 秒｜report.md 有｜${runDir}`)
+    await vi.waitFor(() => expect(h.deliveries.mock.calls.some(([d]) => d.text.includes(String(one.job_id)))).toBe(true))
+    // The stale callback still wakes the worker, but must not touch this record.
+    expect(record()).toMatchObject({ state: 'reviewing', reviewJobId: two.job_id })
+    second.resolve(`done｜1.00 秒｜report.md 有｜${runDir}`)
+    await vi.waitFor(() => expect(record()?.state).toBe('reviewed'))
+    expect(record()).toMatchObject({ critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1 })
+  })
 })
 
 describe('verdict gate and exit-code fidelity', () => {

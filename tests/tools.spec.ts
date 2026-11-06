@@ -572,3 +572,63 @@ it('refuses a ready report when the passing critic is not from a foreign family'
   await expect(same.report()).rejects.toThrow('评审者必须来自异族')
   expect(same.recorded()).toBeUndefined()
 })
+
+it('applies the ready gate to every delegation and lets a superseded verdict pass', async () => {
+  const delegation = (patch: Partial<Delegation>): Delegation => ({
+    id: 'card', chain: '@code', taskDir: '/tmp/card', role: 'builder', jobId: 'fleet-1', state: 'reported',
+    producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: '', family: '' },
+    reviewJobId: '', verdict: '' as Delegation['verdict'], reviewRounds: 0, errorClass: '', startedAt: 'now', endedAt: 'now', ...patch,
+  })
+  const passed = delegation({ id: 'card-b', state: 'verdicted', verdict: 'pass', critic: { worker: 'codex', family: 'gpt' },
+    reviewJobId: 'fleet-2', reviewRounds: 1 })
+  const setup = async (trigger: ReturnType<typeof feishu>) => {
+    const { ticket, sessionId } = await h.acceptedTicket(trigger)
+    const save = (delegations: Delegation[]) => {
+      const current = h.runtime.store.tickets.get(ticket.id)!
+      h.runtime.store.tickets.save({ ...current, delegations })
+    }
+    return { save, report: () => h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' }) }
+  }
+
+  const inFlight = await setup(feishu('1', '@bot 修一下回归'))
+  inFlight.save([delegation({ id: 'card-a', state: 'running' }), passed])
+  await expect(inFlight.report()).rejects.toThrow('委派尚未完成')
+  inFlight.save([delegation({ id: 'card-a', state: 'reviewing' }), passed])
+  await expect(inFlight.report()).rejects.toThrow('委派尚未完成')
+
+  const unreviewed = await setup(feishu('2', '@bot 再修一个'))
+  unreviewed.save([delegation({ id: 'card-a', state: 'reported', reviewRounds: 1 }), passed])
+  await expect(unreviewed.report()).rejects.toThrow('尚未通过异族评审')
+  unreviewed.save([delegation({ id: 'card-a', state: 'reported', reviewRounds: 3 }), passed])
+  await expect(unreviewed.report()).rejects.toThrow('评审轮数已用尽')
+
+  const superseded = await setup(feishu('3', '@bot 还有一个'))
+  superseded.save([delegation({ id: 'card-a', state: 'verdicted', verdict: 'rework',
+    critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1 }), passed])
+  expect(await superseded.report()).toMatchObject({ reported: true })
+})
+
+it('names a failed final delegation and a non-pass verdict distinctly in the ready gate', async () => {
+  const delegation = (patch: Partial<Delegation>): Delegation => ({
+    id: 'card', chain: '@code', taskDir: '/tmp/card', role: 'builder', jobId: 'fleet-1', state: 'failed',
+    producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: '', family: '' },
+    reviewJobId: '', verdict: '' as Delegation['verdict'], reviewRounds: 0, errorClass: 'fleet-exit-5', startedAt: 'now', endedAt: 'now', ...patch,
+  })
+  const setup = async (trigger: ReturnType<typeof feishu>) => {
+    const { ticket, sessionId } = await h.acceptedTicket(trigger)
+    return {
+      save: (patch: Partial<Delegation>) => {
+        const current = h.runtime.store.tickets.get(ticket.id)!
+        h.runtime.store.tickets.save({ ...current, delegations: [delegation(patch)] })
+      },
+      report: () => h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' }),
+    }
+  }
+  const failed = await setup(feishu('1', '@bot 修一下回归'))
+  failed.save({})
+  await expect(failed.report()).rejects.toThrow('最后一次委派失败，没有通过评审的产出')
+
+  const escalated = await setup(feishu('2', '@bot 再修一个'))
+  escalated.save({ state: 'verdicted', verdict: 'escalate', critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1 })
+  await expect(escalated.report()).rejects.toThrow(/escalate.*只有 pass 允许 ready/)
+})

@@ -94,21 +94,33 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         const result = host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
-          // A ready report waits for the last delegation's foreign-family review; no delegation keeps the old behavior.
+          // A ready report waits for every delegation's foreign-family review; no delegation keeps the old behavior.
           if (args.state === 'ready') {
             const delegations = host.store.tickets.get(ticketId)?.delegations ?? []
             const last = delegations.at(-1)
             if (last) {
-              if (last.state === 'running' || last.state === 'reviewing') {
+              // 1. Any in-flight delegation blocks, not only the latest.
+              if (delegations.some(item => item.state === 'running' || item.state === 'reviewing')) {
                 throw new Error('The delegation is still in flight (委派尚未完成); wait for its result before reporting ready')
               }
+              // 2. The latest delegation may not ask for rework.
               if (last.verdict === 'rework') throw new Error('The review requires rework (评审要求返工); address it before reporting ready')
-              if (last.state !== 'verdicted' || !last.verdict) {
-                const rounds = host.resources.store.settings().executor.fleet.reviewRounds
-                if (last.reviewRounds >= rounds) throw new Error(`Review rounds exhausted (评审轮数已用尽): ${last.reviewRounds}/${rounds}; escalate to a person`)
+              // 3. Any delegation that is neither verdicted nor failed must still pass, unless the round budget is spent.
+              //    A superseded delegation (an earlier one already verdicted or failed) is closed and does not block.
+              const rounds = host.resources.store.settings().executor.fleet.reviewRounds
+              const pending = delegations.find(item => (item.state === 'reported' || item.state === 'reviewed') && !item.verdict)
+              if (pending) {
+                if (pending.reviewRounds >= rounds) throw new Error(`Review rounds exhausted (评审轮数已用尽): ${pending.reviewRounds}/${rounds}; escalate to a person`)
                 throw new Error('The delegation has not passed a foreign-family review yet (委派尚未通过异族评审)')
               }
-              if (last.verdict !== 'pass') throw new Error(`The delegation's verdict is ${last.verdict}; only pass allows ready`)
+              // 4. The latest delegation must itself be verdicted pass; other terminal outcomes say so distinctly.
+              if (last.state !== 'verdicted' || last.verdict !== 'pass') {
+                if (last.state === 'failed') {
+                  throw new Error('The final delegation failed and has no reviewed output (最后一次委派失败，没有通过评审的产出); delegate a new card before reporting ready')
+                }
+                throw new Error(`The delegation's verdict is ${last.verdict || '(none)'}; only pass allows ready (只有 pass 允许 ready)`)
+              }
+              // 5. Even a pass needs a critic from another family.
               if (!last.critic.family || last.critic.family === last.producer.family) {
                 throw new Error('The reviewer is not from a foreign family (评审者必须来自异族); ready needs a different-family critic')
               }
