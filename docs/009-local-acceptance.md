@@ -120,10 +120,10 @@ const page = await ctx.remote.session.page({
 
 主控另获 fleet 执行授权后，应在不同专用目录开另一张工单，并明确允许该目录的 `.fleet/tasks/<slug>/` 控制文件及其小型业务产物；不能复用只准写 receipt.txt 的合同。通过同一个正式主 Session 入口，让 worker 使用：
 
-1. `orchestrator_fleet` 的 `card` 创建该工单目录下的卡，按新卡授权写清 whitelist/验收；随后 `argv=["run", "<已准入工人>", "<本工单目录>/.fleet/tasks/<slug>"]`，不含 `--dry-run` 或绕过准入参数。
+1. `orchestrator_fleet` 的 `card` 创建该工单目录下的卡，按新卡授权写清 whitelist/验收；随后 `argv=["run", "@<链类型>", "<本工单目录>/.fleet/tasks/<slug>"]`，不含 `--dry-run` 或绕过准入参数。工人位只填链类型（`@code`/`@complex`/`@bulk`/`@survey`/`@zh-text`/`@visual`），具体工人由宿主按 fleet 证据选定；指名工人会在工具参数校验阶段被拒。
 2. 保存 worker Session 的真实 `tool/call` 与配对 `tool/result`：name=orchestrator_fleet、arguments.argv、callId、job_id。主 Session 不注册该工具，必须核对 Session 是该 ticket 的 worker。
 3. 对照同 job_id 的 `fleet_result` 唤醒消息（或真实 job_output 终态）、任务目录最新 run 回执、实际开始/结束时间、实际工人/模型身份、退出码、结果文件 hash；成功状态与文件独立读回相互印证。单个 job_id/running、模拟回执、旧目录产物不能通过。
-4. 如验收包含异族评审，同样留存 `review --critic <实际不同家族>` 的 tool/call、job_id、终态和评审回执，最后由主控独立检查产物，再核对 orchestrator_report → sent outbox → 主 Session 完整链路。
+4. 如验收包含异族评审，同样留存 `review` 的 tool/call（`arguments.argv=["review", "<本工单目录>/.fleet/tasks/<slug>"]`）、job_id、终态和评审回执。模型侧 argv 不含评审者；宿主按 `fleet critics --producer-family <生产者族>` 的证据注入实际评审者，再从 run 目录 `meta.json` 读出该评审者身份核验族隔离。最后由主控独立检查产物，再核对 orchestrator_report → sent outbox → 主 Session 完整链路。
 
 配置 timeoutMinutes 只是宿主预算；真实执行超过预算、后台失败、准入拒绝、缺少输出都按失败/未知记，不改健康、路由、模型或开关来伪装成功。此步骤不包含在本次执行授权中。
 
