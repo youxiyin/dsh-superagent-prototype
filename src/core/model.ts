@@ -277,6 +277,25 @@ export type TicketEndBy = 'executor' | 'human'
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
 export interface Attention { id: string; question: string; triggerId?: string }
+/** A fleet task delegated by a ticket's Executor, with the actual producer and critic identities recorded by the host. */
+export interface Delegation {
+  id: string
+  chain: string
+  taskDir: string
+  role: 'builder' | 'reader' | 'mass'
+  jobId: string
+  state: 'carded' | 'running' | 'reported' | 'reviewing' | 'reviewed' | 'verdicted' | 'failed'
+  producer: { worker: string; family: string; routeId?: string; model?: string }
+  critic: { worker: string; family: string }
+  reviewJobId: string
+  verdict: 'pass' | 'rework' | 'escalate' | 'close'
+  reviewRounds: number
+  errorClass: string
+  /** A host-recorded hint for display only; it takes no part in decisions. */
+  note?: string
+  startedAt: string
+  endedAt: string
+}
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -290,6 +309,7 @@ export interface Ticket {
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
   assignments: Assignment[]
+  delegations?: Delegation[]
   inputs: TicketInput[]
   /** Inputs not yet handed to a running assignment. */
   undelivered: string[]
