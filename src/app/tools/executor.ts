@@ -24,7 +24,7 @@ export interface ExecutorToolsHost {
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
   return [
-    ...fleetTools(host.resources, host.sessions, ticket),
+    ...fleetTools(host.resources, host.sessions, ticket, work => host.store.atomic(work)),
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
@@ -94,6 +94,26 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         const result = host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
+          // A ready report waits for the last delegation's foreign-family review; no delegation keeps the old behavior.
+          if (args.state === 'ready') {
+            const delegations = host.store.tickets.get(ticketId)?.delegations ?? []
+            const last = delegations.at(-1)
+            if (last) {
+              if (last.state === 'running' || last.state === 'reviewing') {
+                throw new Error('The delegation is still in flight (委派尚未完成); wait for its result before reporting ready')
+              }
+              if (last.verdict === 'rework') throw new Error('The review requires rework (评审要求返工); address it before reporting ready')
+              if (last.state !== 'verdicted' || !last.verdict) {
+                const rounds = host.resources.store.settings().executor.fleet.reviewRounds
+                if (last.reviewRounds >= rounds) throw new Error(`Review rounds exhausted (评审轮数已用尽): ${last.reviewRounds}/${rounds}; escalate to a person`)
+                throw new Error('The delegation has not passed a foreign-family review yet (委派尚未通过异族评审)')
+              }
+              if (last.verdict !== 'pass') throw new Error(`The delegation's verdict is ${last.verdict}; only pass allows ready`)
+              if (!last.critic.family || last.critic.family === last.producer.family) {
+                throw new Error('The reviewer is not from a foreign family (评审者必须来自异族); ready needs a different-family critic')
+              }
+            }
+          }
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }

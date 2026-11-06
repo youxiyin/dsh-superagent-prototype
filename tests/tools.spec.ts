@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { builtInBase, builtInParts, defaultPrompts } from '../src/app/prompts.ts'
-import { UserError } from '../src/core/index.ts'
+import { UserError, type Delegation } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -488,4 +488,87 @@ it('gives a worker the other messages of the request its ticket was accepted fro
   const page = await h.runTool(`worker-${ticket.id}`, 'orchestrator_read', { resource: `ticket/${ticket.id}` })
   expect(page).toMatchObject({ batch: [{ trigger_id: other, read: `trigger/${other}` }] })
   expect(await h.runTool(`worker-${ticket.id}`, 'orchestrator_read', { resource: `trigger/${other}` })).toMatchObject({ trigger_id: other })
+})
+
+it('holds a ready report until the last delegation passed a foreign-family review', async () => {
+  const delegation = (patch: Partial<Delegation>): Delegation => ({
+    id: 'card', chain: '@code', taskDir: '/tmp/card', role: 'builder', jobId: 'fleet-1', state: 'reviewed',
+    producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: 'codex', family: 'gpt' },
+    reviewJobId: 'fleet-2', verdict: '' as Delegation['verdict'], reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now', ...patch,
+  })
+  const ready = async (trigger: ReturnType<typeof feishu>) => {
+    const { ticket, sessionId } = await h.acceptedTicket(trigger)
+    return {
+      ticket, sessionId,
+      save: (patch: Partial<Delegation>) => {
+        const current = h.runtime.store.tickets.get(ticket.id)!
+        h.runtime.store.tickets.save({ ...current, delegations: [delegation(patch)] })
+      },
+      report: () => h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' }),
+      recorded: () => h.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.report,
+    }
+  }
+  const unreviewed = await ready(feishu('1', '@bot 修一下回归'))
+  unreviewed.save({})
+  await expect(unreviewed.report()).rejects.toThrow('尚未通过异族评审')
+  expect(unreviewed.recorded()).toBeUndefined()
+
+  const rework = await ready(feishu('2', '@bot 再修一个'))
+  rework.save({ verdict: 'rework' })
+  await expect(rework.report()).rejects.toThrow('评审要求返工')
+  expect(rework.recorded()).toBeUndefined()
+
+  const exhausted = await ready(feishu('3', '@bot 还有一个'))
+  exhausted.save({ reviewRounds: h.runtime.store.settings().executor.fleet.reviewRounds })
+  await expect(exhausted.report()).rejects.toThrow('评审轮数已用尽')
+  expect(exhausted.recorded()).toBeUndefined()
+
+  unreviewed.save({ state: 'running' })
+  await expect(unreviewed.report()).rejects.toThrow('委派尚未完成')
+  expect(unreviewed.recorded()).toBeUndefined()
+
+  rework.save({ state: 'reviewing' })
+  await expect(rework.report()).rejects.toThrow('委派尚未完成')
+  expect(rework.recorded()).toBeUndefined()
+
+})
+
+it('lets a ready report through once the last delegation verdict passed', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const current = h.runtime.store.tickets.get(ticket.id)!
+  h.runtime.store.tickets.save({ ...current, delegations: [{
+    id: 'card', chain: '@code', taskDir: '/tmp/card', role: 'builder', jobId: 'fleet-1', state: 'verdicted',
+    producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: 'codex', family: 'gpt' },
+    reviewJobId: 'fleet-2', verdict: 'pass', reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now',
+  }] })
+  expect(await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' })).toMatchObject({ reported: true })
+})
+
+it('refuses a ready report when the passing critic is not from a foreign family', async () => {
+  const delegation = (patch: Partial<Delegation>): Delegation => ({
+    id: 'card', chain: '@code', taskDir: '/tmp/card', role: 'builder', jobId: 'fleet-1', state: 'verdicted',
+    producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: 'codex', family: 'gpt' },
+    reviewJobId: 'fleet-2', verdict: 'pass', reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now', ...patch,
+  })
+  const ready = async (trigger: ReturnType<typeof feishu>) => {
+    const { ticket, sessionId } = await h.acceptedTicket(trigger)
+    return {
+      ticket,
+      save: (patch: Partial<Delegation>) => {
+        const current = h.runtime.store.tickets.get(ticket.id)!
+        h.runtime.store.tickets.save({ ...current, delegations: [delegation(patch)] })
+      },
+      report: () => h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' }),
+      recorded: () => h.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.report,
+    }
+  }
+  const empty = await ready(feishu('1', '@bot 修一下回归'))
+  empty.save({ critic: { worker: '', family: '' } })
+  await expect(empty.report()).rejects.toThrow('评审者必须来自异族')
+  expect(empty.recorded()).toBeUndefined()
+
+  const same = await ready(feishu('2', '@bot 再修一个'))
+  same.save({ critic: { worker: 'kimi-k3-1-pro', family: 'moonshot' } })
+  await expect(same.report()).rejects.toThrow('评审者必须来自异族')
+  expect(same.recorded()).toBeUndefined()
 })

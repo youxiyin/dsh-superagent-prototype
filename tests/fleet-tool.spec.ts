@@ -7,8 +7,9 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fleetArgv } from '../src/app/tools/fleet.ts'
 import { runningJobs, stopBackground, untilQuiet } from '../src/executor/background.ts'
-import { Commands, commandError } from '../src/infra/commands.ts'
+import { CliError, Commands, commandError } from '../src/infra/commands.ts'
 import { SettingsSchema } from '../src/policy.ts'
+import type { Delegation } from '../src/core/model.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 // Observe subprocess options while retaining real execFile execution for argv and timeout checks.
@@ -32,7 +33,7 @@ async function worker(enabled = true, bin = 'fleet', timeoutMinutes = 180) {
 }
 
 it('defaults to disabled and never registers on a disabled worker or the main Session', async () => {
-  expect(SettingsSchema.parse({}).executor.fleet).toEqual({ enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000 })
+  expect(SettingsSchema.parse({}).executor.fleet).toEqual({ enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] })
   const { sessionId } = await worker(false)
   expect(h.tools.get(sessionId)?.has('orchestrator_fleet')).toBe(false)
   expect(h.tools.get(h.runtime.masterId)?.has('orchestrator_fleet')).toBe(false)
@@ -77,13 +78,13 @@ it('rejects symlink task escapes and symlink fleet roots', async () => {
   const another = join(h.directory, 'another'); mkdirSync(another)
   symlinkSync(join(directory, '.fleet'), join(another, '.fleet'))
   expect(() => fleetArgv(['card', another, 'escape'], another)).toThrow('symlinks')
-  expect(fleetArgv(['review', task, '--critic=@critic', '--base', 'HEAD~1'], directory)).toEqual(['review', task, '--critic=@critic', '--base', 'HEAD~1'])
+  expect(fleetArgv(['review', task, '--critic=@critic', '--base', 'HEAD~1'], directory)).toEqual(['review', task, '--base', 'HEAD~1'])
 })
 
 it('passes literal argv through real Commands.execFile without shell expansion', async () => {
   const bin = join(h.directory, 'fleet fixture'), marker = join(h.directory, 'should-not-exist')
   writeFileSync(bin, '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)))\n', { mode: 0o700 })
-  const { call, directory } = await worker(true, bin)
+  const { call, directory, ticket } = await worker(true, bin)
   vi.mocked(Commands.prototype.run).mockRestore()
   const argv = ['card', directory, 'literal', '--title', `中文 spaces; $(touch '${marker}') \`touch '${marker}'\` & > file`]
   expect(JSON.parse(String((await call(argv)).stdout))).toEqual(argv)
@@ -91,6 +92,13 @@ it('passes literal argv through real Commands.execFile without shell expansion',
   const exec = vi.mocked(promisify(execFile))
   expect(exec).toHaveBeenLastCalledWith(bin, argv, expect.objectContaining({ cwd: directory, timeout: 90_000 }))
   expect(exec.mock.calls.at(-1)![2]).not.toHaveProperty('shell')
+  const current = h.runtime.store.tickets.get(ticket.id)!
+  h.runtime.store.tickets.save({ ...current, delegations: [{
+    id: 'test-card', chain: '@complex', taskDir: join(directory, '.fleet', 'tasks', 'test-card'), role: 'builder',
+    jobId: 'fleet-0', state: 'reviewed', producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' },
+    critic: { worker: 'codex', family: 'gpt' }, reviewJobId: 'fleet-1', verdict: '' as Delegation['verdict'],
+    reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now',
+  }] })
   for (const args of [['ls'], ['status'], ['critics', '--producer-family', 'codex'], ['verdict', join(directory, '.fleet', 'tasks', 'test-card'), 'pass']]) {
     await call(args)
     expect(exec.mock.calls.at(-1)![2]).toMatchObject({ timeout: 90_000 })
@@ -99,7 +107,7 @@ it('passes literal argv through real Commands.execFile without shell expansion',
 
 it('validates integer fleet timeout and report bounds and fills defaults in older fleet settings', () => {
   const parse = (fleet: Record<string, unknown>) => SettingsSchema.parse({ executor: { fleet } }).executor.fleet
-  expect(parse({ enabled: true, bin: 'custom-fleet' })).toEqual({ enabled: true, bin: 'custom-fleet', timeoutMinutes: 180, reportMaxChars: 20000 })
+  expect(parse({ enabled: true, bin: 'custom-fleet' })).toEqual({ enabled: true, bin: 'custom-fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] })
   for (const value of [0, 601, 1.5]) expect(() => parse({ timeoutMinutes: value })).toThrow()
   for (const value of [999, 100001, 1000.5]) expect(() => parse({ reportMaxChars: value })).toThrow()
   expect(parse({ timeoutMinutes: 1, reportMaxChars: 1000 })).toMatchObject({ timeoutMinutes: 1, reportMaxChars: 1000 })
@@ -117,13 +125,23 @@ it('enforces a custom Commands timeout and reports actual seconds, including whe
 
 describe('background fleet commands', () => {
   it.each(['run', 'review'])('%s returns while still running and wakes the worker on completion', async command => {
-    const { call, task, sessionId, directory } = await worker(true, 'fleet', 47)
+    const { call, task, sessionId, directory, ticket } = await worker(true, 'fleet', 47)
+    if (command === 'review') {
+      const current = h.runtime.store.tickets.get(ticket.id)!
+      h.runtime.store.tickets.save({ ...current, delegations: [{
+        id: 'test-card', chain: '@complex', taskDir: task, role: 'builder', jobId: 'fleet-0', state: 'reported',
+        producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: '', family: '' }, reviewJobId: '',
+        verdict: '' as Delegation['verdict'], reviewRounds: 0, errorClass: '', startedAt: 'now', endedAt: 'now',
+      }] })
+    }
     const pending = Promise.withResolvers<string>()
-    vi.mocked(Commands.prototype.run).mockReturnValue(pending.promise)
+    vi.mocked(Commands.prototype.run).mockImplementation((_bin, args) =>
+      args[0] === 'critics' ? Promise.resolve('评审证据（生产族 moonshot）：\ncodex｜family=gpt｜pool=p｜critic自检=ok') : pending.promise)
     const argv = command === 'run' ? ['run', '@complex', task] : ['review', task, '--critic', '@critic']
+    const expected = command === 'run' ? argv : ['review', task, '--critic', '@review']
     const result = await call(argv)
     expect(result).toMatchObject({ status: 'running', job_id: expect.stringMatching(/^fleet-/) })
-    expect(Commands.prototype.run).toHaveBeenCalledWith('fleet', argv, directory, 47 * 60_000)
+    expect(Commands.prototype.run).toHaveBeenCalledWith('fleet', expected, directory, 47 * 60_000)
     expect(runningJobs(h.ctx, sessionId).map(job => job.id)).toContain(result.job_id)
     const agent = h.agents.get(sessionId)!; agent.status = 'idle'
     const quiet = untilQuiet(h.ctx, agent as unknown as Agent, new AbortController().signal)
@@ -158,14 +176,16 @@ describe('background fleet commands', () => {
   })
 
   it('wakes on failure and stops host commands with the assignment without a completion wake', async () => {
-    const { call, task, sessionId } = await worker()
+    const { call, task, sessionId, directory } = await worker()
     vi.mocked(Commands.prototype.run).mockRejectedValueOnce(new Error('fleet failed'))
     await call(['run', '@complex', task])
     await vi.waitFor(() => expect(h.deliveries.mock.calls.some(([d]) => d.text.includes('fleet failed'))).toBe(true))
+    // A card slug is spent: a second delegation on this ticket needs a new card.
+    const next = join(directory, '.fleet', 'tasks', 'test-card-2'); mkdirSync(next, { recursive: true })
     const pending = Promise.withResolvers<string>()
     vi.mocked(Commands.prototype.run).mockReturnValue(pending.promise)
     const signal = vi.spyOn(Commands.prototype, 'withSignal')
-    await call(['run', '@complex', task])
+    await call(['run', '@complex', next])
     const stopSignal = signal.mock.calls.at(-1)![0]!
     h.deliveries.mockClear()
     const stopping = stopBackground(h.ctx, sessionId, 'assignment stopped')
@@ -174,5 +194,124 @@ describe('background fleet commands', () => {
     await stopping
     expect(runningJobs(h.ctx, sessionId)).toEqual([])
     expect(h.deliveries.mock.calls.some(([d]) => d.text.includes('fleet_result'))).toBe(false)
+  })
+})
+
+describe('delegation placeholders, attribution and review prechecks', () => {
+  const recorded = (patch: Partial<Delegation>): Delegation => ({
+    id: 'test-card', chain: '@complex', taskDir: '/tmp/test-card', role: 'builder', jobId: 'fleet-0', state: 'reported',
+    producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: '', family: '' }, reviewJobId: '',
+    verdict: '' as Delegation['verdict'], reviewRounds: 0, errorClass: '', startedAt: 'now', endedAt: 'now', ...patch,
+  })
+  const seed = (ticketId: string, patch: Partial<Delegation> = {}) => {
+    const current = h.runtime.store.tickets.get(ticketId)!
+    h.runtime.store.tickets.save({ ...current, delegations: [recorded(patch)] })
+  }
+
+  it('writes the running placeholder before the command starts and refuses a reused card', async () => {
+    const { call, task, ticket } = await worker()
+    const pending = Promise.withResolvers<string>()
+    vi.mocked(Commands.prototype.run).mockReturnValue(pending.promise)
+    expect(await call(['run', '@complex', task])).toMatchObject({ status: 'running' })
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations).toMatchObject([{
+      id: 'test-card', state: 'running', role: 'builder', jobId: '', producer: { worker: '', family: '' },
+      critic: { worker: '', family: '' }, reviewRounds: 0, errorClass: '', endedAt: '',
+    }])
+    await expect(call(['run', '@complex', task])).rejects.toThrow(/新卡/)
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations).toHaveLength(1)
+    pending.resolve('done｜1.00 秒｜report.md 无｜')
+    await vi.waitFor(() => expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)?.state).toBe('failed'))
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({
+      producer: { worker: '', family: '' }, errorClass: 'missing-run-dir',
+    })
+  })
+
+  it('refuses a review with no candidate and leaves the delegation reported', async () => {
+    const { call, task, ticket, directory, sessionId } = await worker()
+    seed(ticket.id)
+    vi.mocked(Commands.prototype.run).mockResolvedValue('评审证据（生产族 moonshot）：\n（无）')
+    await expect(call(['review', task])).rejects.toThrow('当前没有可派的不同家族评审者')
+    expect(Commands.prototype.run).toHaveBeenCalledWith('fleet', ['critics', '--producer-family', 'moonshot'], directory)
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'reported' })
+    expect(runningJobs(h.ctx, sessionId)).toEqual([])
+  })
+
+  it('refuses a review whose producer family is unknown', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { producer: { worker: '', family: '' } })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['review', task])).rejects.toThrow('生产族')
+    expect(run).not.toHaveBeenCalled()
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'reported' })
+  })
+
+  it('records a failed review by exit code without borrowing a historical run or spending a round', async () => {
+    const { call, task, ticket, directory } = await worker()
+    seed(ticket.id)
+    const historical = join(task, 'runs', '20261105-230000-codex-builder'); mkdirSync(historical, { recursive: true })
+    writeFileSync(join(historical, 'meta.json'), JSON.stringify({ status: 'done', worker: 'codex', family: 'gpt', report_exists: true }))
+    vi.mocked(Commands.prototype.run).mockImplementation(async (_bin, args) => {
+      if (args[0] === 'critics') return '评审证据（生产族 moonshot）：\ncodex｜family=gpt｜pool=p｜critic自检=ok'
+      throw new Error('fleet exited with code 4')
+    })
+    await call(['review', task])
+    await vi.waitFor(() => expect(h.deliveries.mock.calls.some(([d]) => d.text.includes('fleet_result'))).toBe(true))
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({
+      state: 'reported', producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' },
+      critic: { worker: '', family: '' }, reviewRounds: 0, errorClass: 'fleet-exit-4',
+    })
+    expect(Commands.prototype.run).toHaveBeenCalledWith('fleet', ['critics', '--producer-family', 'moonshot'], directory)
+  })
+})
+
+describe('verdict gate and exit-code fidelity', () => {
+  const recorded = (patch: Partial<Delegation>): Delegation => ({
+    id: 'test-card', chain: '@complex', taskDir: '/tmp/test-card', role: 'builder', jobId: 'fleet-0', state: 'reviewed',
+    producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: 'codex', family: 'gpt' }, reviewJobId: 'fleet-1',
+    verdict: '' as Delegation['verdict'], reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now', ...patch,
+  })
+  const seed = (ticketId: string, patch: Partial<Delegation> = {}) => {
+    const current = h.runtime.store.tickets.get(ticketId)!
+    h.runtime.store.tickets.save({ ...current, delegations: [recorded(patch)] })
+  }
+
+  it('refuses a verdict while the delegation is still in flight and calls nothing', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { state: 'running', producer: { worker: '', family: '' }, critic: { worker: '', family: '' }, reviewRounds: 0 })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['verdict', task, 'pass'])).rejects.toThrow(/尚未完成|在飞|未结束/)
+    expect(run).not.toHaveBeenCalled()
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'running', verdict: '' })
+  })
+
+  it('refuses a pass until a completed foreign-family review is recorded', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { state: 'reported', critic: { worker: '', family: '' } })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['verdict', task, 'pass'])).rejects.toThrow(/异族|评审/)
+    expect(run).not.toHaveBeenCalled()
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'reported', verdict: '' })
+
+    seed(ticket.id, { state: 'reviewed', critic: { worker: 'kimi-k3-1-pro', family: 'moonshot' } })
+    await expect(call(['verdict', task, 'pass'])).rejects.toThrow(/异族|评审/)
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('allows rework on a failed delegation once it is no longer in flight', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { state: 'failed', errorClass: 'fleet-exit-4' })
+    vi.mocked(Commands.prototype.run).mockResolvedValue('rework recorded')
+    await call(['verdict', task, 'rework'])
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'verdicted', verdict: 'rework' })
+  })
+
+  it('keeps the fleet exit code from the original CliError before it is stringified', async () => {
+    const { call, task, ticket } = await worker()
+    vi.mocked(Commands.prototype.run).mockImplementation(async () => {
+      throw new CliError('外部生产家族未知或与本卡运行记录冲突', undefined, 4)
+    })
+    await call(['run', '@complex', task])
+    await vi.waitFor(() => expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)?.errorClass).not.toBe(''), { timeout: 3000 })
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'failed', errorClass: 'fleet-exit-4' })
   })
 })
