@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { registerHttp } from '../src/app/http.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
@@ -6,14 +6,15 @@ import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
+import type { FleetStatsReader, FleetStatsView } from '../src/app/views/settings.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
 /** Mount management HTTP routes on a fake web server and return a request helper that includes default panel headers. */
-function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
+function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1', readStats?: FleetStatsReader) {
   let handler: Handler = async () => {}
   const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
-  registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
+  registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost, readStats)
   return async (method: string, path: string, body?: unknown, headers: Headers = {}) => {
     let status = 0, text = ''
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
@@ -95,4 +96,89 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
   expect(await call('PUT', 'settings/executor', { value, revision: 0 })).toEqual({ status: 400,
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
+})
+
+function settingsRuntime(bin = '/opt/fleet') {
+  const settings = SettingsSchema.parse({ executor: { fleet: { bin } } })
+  return {
+    store: { settings: () => settings, blockRevision: () => 0, get: () => undefined },
+    sources: { instances: () => [], environments: () => [], declarations: () => [] },
+    health: {}, machine: { stateDir: '/state' }, configured: () => false,
+  }
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void, reject!: (error: Error) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
+}
+
+it('returns Settings before a pending fleet stats read and degrades its failure to unknown', async () => {
+  const reading = deferred<FleetStatsView>()
+  let settled = false
+  void reading.promise.then(() => { settled = true }, () => { settled = true })
+  const read = vi.fn(() => reading.promise)
+  const call = serve(settingsRuntime(), undefined, read)
+  const response = await call('GET', 'settings')
+  expect(response).toMatchObject({ status: 200, body: { stats: { summary: null } } })
+  expect(settled).toBe(false)
+  expect(read).toHaveBeenCalledOnce()
+  reading.reject(new Error('fleet missing'))
+  await reading.promise.catch(() => {})
+  expect(await call('GET', 'settings')).toMatchObject({ status: 200, body: { stats: { summary: null } } })
+  expect(read).toHaveBeenCalledOnce()
+})
+
+it('shares one pending fleet stats read across concurrent Settings requests', async () => {
+  const reading = deferred<FleetStatsView>()
+  let settled = false
+  void reading.promise.then(() => { settled = true })
+  const read = vi.fn(() => reading.promise)
+  const call = serve(settingsRuntime(), undefined, read)
+  const responses = await Promise.all([call('GET', 'settings'), call('GET', 'settings')])
+  expect(responses.map(response => response.status)).toEqual([200, 200])
+  expect(responses.map(response => response.body.stats)).toEqual([{ summary: null }, { summary: null }])
+  expect(settled).toBe(false)
+  expect(read).toHaveBeenCalledOnce()
+  reading.resolve({ summary: 'Runs: 4\nCost: $2.50' })
+  await reading.promise
+  expect(await call('GET', 'settings')).toMatchObject({ status: 200, body: { stats: { summary: 'Runs: 4\nCost: $2.50' } } })
+  expect(read).toHaveBeenCalledOnce()
+})
+
+it('refreshes expired fleet stats in the background while fresh values stay cached', async () => {
+  vi.useFakeTimers()
+  try {
+    const first = deferred<FleetStatsView>(), second = deferred<FleetStatsView>()
+    const read = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const call = serve(settingsRuntime(), undefined, read)
+    expect(await call('GET', 'settings')).toMatchObject({ body: { stats: { summary: null } } })
+    first.resolve({ summary: 'old' })
+    await first.promise
+    expect(await call('GET', 'settings')).toMatchObject({ body: { stats: { summary: 'old' } } })
+    expect(read).toHaveBeenCalledOnce()
+    vi.advanceTimersByTime(30_000)
+    expect(await call('GET', 'settings')).toMatchObject({ status: 200, body: { stats: { summary: null } } })
+    expect(read).toHaveBeenCalledTimes(2)
+    second.resolve({ summary: 'new' })
+    await second.promise
+    expect(await call('GET', 'settings')).toMatchObject({ body: { stats: { summary: 'new' } } })
+    expect(read).toHaveBeenCalledTimes(2)
+  } finally { vi.useRealTimers() }
+})
+
+it('keeps fleet stats caches isolated between HTTP server instances', async () => {
+  const first = deferred<FleetStatsView>(), second = deferred<FleetStatsView>()
+  const readFirst = vi.fn(() => first.promise), readSecond = vi.fn(() => second.promise)
+  const callFirst = serve(settingsRuntime(), undefined, readFirst)
+  const callSecond = serve(settingsRuntime(), undefined, readSecond)
+  await callFirst('GET', 'settings')
+  first.resolve({ summary: 'first' })
+  await first.promise
+  expect(await callFirst('GET', 'settings')).toMatchObject({ body: { stats: { summary: 'first' } } })
+  expect(await callSecond('GET', 'settings')).toMatchObject({ body: { stats: { summary: null } } })
+  expect(readSecond).toHaveBeenCalledOnce()
+  second.resolve({ summary: 'second' })
+  await second.promise
+  expect(await callSecond('GET', 'settings')).toMatchObject({ body: { stats: { summary: 'second' } } })
+  expect(await callFirst('GET', 'settings')).toMatchObject({ body: { stats: { summary: 'first' } } })
 })

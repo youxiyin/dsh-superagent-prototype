@@ -47,11 +47,20 @@ export function ticketRow(view: Snapshot, ticket: Ticket) {
   const reply = line.stage === 'person' && channel ? channelLink(view, channel) : undefined
   return { ...line, ...reply ? { reply } : {} }
 }
-/** Executor slot utilization: `running` worker Sessions in an active turn (which occupy slots and are interrupted by a restart), and tickets `queued` for a slot. */
-export interface ExecutorLoad { running: number; queued: number }
+/** Executor slot utilization and delegation counts derived from the same Ticket stages shown by the panel. */
+export interface ExecutorLoad {
+  running: number; queued: number
+  delegationStats?: { delegating: number; reviewing: number; awaitingVerdict: number }
+}
 export function executorLoad(store: Store, running: number): ExecutorLoad {
+  const open = store.tickets.open()
+  const stages = open.map(ticket => ticketStage(ticket))
+  const action = (shown: 'delegating' | 'reviewing') => stages.filter(stage => stage.stage === 'working' && stage.action === shown).length
   const queued = (ticket: Ticket) => { const stage = ticketStage(ticket); return stage.stage === 'working' && stage.action === 'queued' }
-  return { running, queued: store.tickets.open().filter(queued).length }
+  const awaitingVerdict = open.flatMap(ticket => ticket.delegations ?? [])
+    .filter(delegation => (delegation.state === 'reported' || delegation.state === 'reviewed') && !delegation.verdict).length
+  return { running, queued: open.filter(queued).length,
+    delegationStats: { delegating: action('delegating'), reviewing: action('reviewing'), awaitingVerdict } }
 }
 export function ticketDetail(host: ViewHost, id: string) {
   const { store } = host
@@ -71,8 +80,16 @@ export function ticketDetail(host: ViewHost, id: string) {
   }
   // Pass `human = false` for bot-originated mandates so the Source kind still labels the actor as a bot if removed from the policy list.
   const human = ticket.mandate.basis.via !== 'bot'
+  const settings = store.settings()
+  const delegations = ticket.delegations?.map(delegation => ({
+    id: delegation.id, chain: delegation.chain, state: delegation.state, producer: delegation.producer, critic: delegation.critic,
+    reviewRounds: delegation.reviewRounds, verdict: delegation.verdict, errorClass: delegation.errorClass,
+    ...delegation.note ? { note: delegation.note } : {},
+    problem: !!delegation.errorClass || delegation.verdict === 'rework' || delegation.reviewRounds >= settings.executor.fleet.reviewRounds,
+  }))
   return { ...ticketLine(view, ticket), mandate: { ...ticket.mandate, actor: view.actor(ticket.mandate.actor, human) },
-    basis: basisFacts(ticket.mandate.basis, view.rule), paused: store.settings().paused,
+    basis: basisFacts(ticket.mandate.basis, view.rule), paused: settings.paused,
+    ...delegations?.length ? { delegations } : {},
     channels: ticket.channels.map(channel => channelLink(view, channel)),
     decision: decision ? decisionView(view, decision) : undefined,
     // Every started Assignment ran in the ticket's one worker Session. A running assignment whose worker reported a non-progress state has finished its turn unless a human response resumed the ticket.

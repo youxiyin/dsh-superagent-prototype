@@ -288,7 +288,11 @@ export interface Delegation {
   producer: { worker: string; family: string; routeId?: string; model?: string }
   critic: { worker: string; family: string }
   reviewJobId: string
+  /** The host-parsed conclusion of the latest review; missing on legacy records, which the verdict gate treats as unknown. */
+  reviewConclusion?: 'pass' | 'rework' | 'unknown'
   verdict: 'pass' | 'rework' | 'escalate' | 'close'
+  /** The exact, host-validated reason supplied when a pass overrides a rework review. */
+  overrideReason?: string
   reviewRounds: number
   errorClass: string
   /** A host-recorded hint for display only; it takes no part in decisions. */

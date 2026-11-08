@@ -3,7 +3,7 @@ import { useRef, useState } from 'react'
 import { TICKET_FILTERS, type TicketFilter } from '../app/api.ts'
 import { LIMITS } from '../limits.ts'
 import { usePoll, type SettingsView, type SourceView, type StateView } from './api.ts'
-import { DisclosureRow, Icon, InfoTip, Input, Pill } from './controls.tsx'
+import { DisclosureRow, Icon, InfoTip, Input, Pill, Switch } from './controls.tsx'
 import { SaveBar } from './draft.tsx'
 import { usePanel } from './provider.tsx'
 import { TicketLine } from './rows.tsx'
@@ -74,14 +74,37 @@ function EnvironmentVariables({ groups, sources,
 }
 export function ExecutionSettings() {
   const { t } = usePanel()
-  const { blocks, environment, sources } = useSettings().settings
+  const { blocks, environment, sources, stats } = useSettings().settings
   // Keep raw user text (such as separators between blocked commands) in the draft and parse only on save.
   const executor = blocks.executor.value
-  const saved = { ...executor, maxWorkers: String(executor.maxWorkers), blockedCommands: executor.blockedCommands.join(' ') }
-  const draft = useBlockDraft('executor', saved, blocks.executor.revision,
-    value => ({ ...value, maxWorkers: numberOf(value.maxWorkers), blockedCommands: value.blockedCommands.split(/[\s,]+/).filter(Boolean) }))
+  const saved = {
+    ...executor, maxWorkers: String(executor.maxWorkers), blockedCommands: executor.blockedCommands.join(' '),
+    fleet: {
+      ...executor.fleet, timeoutMinutes: String(executor.fleet.timeoutMinutes), reportMaxChars: String(executor.fleet.reportMaxChars),
+      allowedChains: executor.fleet.allowedChains.join(' '), delegationsPerTicket: String(executor.fleet.delegationsPerTicket),
+      reviewRounds: String(executor.fleet.reviewRounds), freeMaterialSensitivity: executor.fleet.freeMaterialSensitivity.join(' '),
+    },
+  }
+  const draft = useBlockDraft('executor', saved, blocks.executor.revision, value => ({
+    ...value, maxWorkers: numberOf(value.maxWorkers), blockedCommands: value.blockedCommands.split(/[\s,]+/).filter(Boolean),
+    fleet: {
+      ...value.fleet, timeoutMinutes: numberOf(value.fleet.timeoutMinutes), reportMaxChars: numberOf(value.fleet.reportMaxChars),
+      allowedChains: value.fleet.allowedChains.split(/[\s,]+/).filter(Boolean),
+      delegationsPerTicket: numberOf(value.fleet.delegationsPerTicket), reviewRounds: numberOf(value.fleet.reviewRounds),
+      freeMaterialSensitivity: value.fleet.freeMaterialSensitivity.split(/[\s,]+/).filter(Boolean),
+    },
+  }))
   const value = draft.value
   const edit = (next: Partial<typeof value>) => draft.edit({ ...value, ...next })
+  const fleetNumber = (key: 'timeoutMinutes' | 'reportMaxChars' | 'delegationsPerTicket' | 'reviewRounds', label: string,
+    min: number, max?: number) => <Field label={label}>
+    <Input type="number" min={min} max={max} required value={value.fleet[key]}
+      onChange={event => edit({ fleet: { ...value.fleet, [key]: event.target.value } })} />
+  </Field>
+  const fleetSwitch = (key: 'enabled' | 'allowFree', label: string) => <div className="dt-switch-row">
+    <div className="dt-field-head">{label}</div>
+    <Switch checked={value.fleet[key]} onChange={next => edit({ fleet: { ...value.fleet, [key]: next } })} label={label} />
+  </div>
   const prepare = useRef<HTMLTextAreaElement>(null)
   const insert = (key: string) => {
     const field = prepare.current
@@ -100,6 +123,31 @@ export function ExecutionSettings() {
             <Input type="number" min={LIMITS.maxWorkers.min} max={LIMITS.maxWorkers.max} required value={value.maxWorkers}
               onChange={event => edit({ maxWorkers: event.target.value })} />
           </Field>
+        </div>
+        <div className="dt-form dt-block">
+          <h2 className="dt-block-title">{t('fleetSettings')}<InfoTip text={t('fleetSettingsHint')} /></h2>
+          {fleetSwitch('enabled', t('fleetEnabled'))}
+          <Field label={t('fleetBin')}>
+            <Input className="dt-mono" required spellCheck={false} value={value.fleet.bin}
+              onChange={event => edit({ fleet: { ...value.fleet, bin: event.target.value } })} />
+          </Field>
+          {fleetNumber('timeoutMinutes', t('fleetTimeoutMinutes'), 1, 600)}
+          {fleetNumber('reportMaxChars', t('fleetReportMaxChars'), 1000, 100000)}
+          <Field label={t('fleetAllowedChains')} hint={t('fleetListHint')}>
+            <Input className="dt-mono" spellCheck={false} value={value.fleet.allowedChains}
+              onChange={event => edit({ fleet: { ...value.fleet, allowedChains: event.target.value } })} />
+          </Field>
+          {fleetNumber('delegationsPerTicket', t('fleetDelegationsPerTicket'), 1)}
+          {fleetNumber('reviewRounds', t('fleetReviewRounds'), 1)}
+          {fleetSwitch('allowFree', t('fleetAllowFree'))}
+          <Field label={t('fleetFreeMaterialSensitivity')} hint={t('fleetListHint')}>
+            <Input className="dt-mono" spellCheck={false} value={value.fleet.freeMaterialSensitivity}
+              onChange={event => edit({ fleet: { ...value.fleet, freeMaterialSensitivity: event.target.value } })} />
+          </Field>
+          <div className="dt-field">
+            <div className="dt-field-head">{t('fleetCost')}<InfoTip text={t('fleetCostHint')} /></div>
+            {stats?.summary ? <pre className="dt-mono">{stats.summary}</pre> : <Hint>{t('fleetCostUnavailable')}</Hint>}
+          </div>
         </div>
         <div className="dt-form dt-block">
           <h2 className="dt-block-title">{t('term.environment')}<InfoTip text={t('environmentIntro')} /></h2>

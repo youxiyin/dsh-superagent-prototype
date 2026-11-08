@@ -61,6 +61,30 @@ export function readRunOutcome(taskDir: string, runDir?: string): RunOutcome {
 }
 
 /**
+ * Parse only fleet's exact `结论：通过/需返工/返工` lines after removing heading and emphasis markers. Rework wins
+ * wherever it appears; negated, qualified, or unrecognized values contribute nothing and leave the review `unknown`.
+ */
+export function parseReviewConclusion(text: string): NonNullable<Delegation['reviewConclusion']> {
+  const stripEmphasis = (value: string): string => value.replace(/^[*_]+|[*_]+$/g, '')
+  let pass = false
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = stripEmphasis(rawLine.trim().replace(/^#+\s*/, ''))
+    const match = /^结论\s*[：:]\s*(.*)$/.exec(line)
+    if (!match) continue
+    const value = stripEmphasis(match[1]!.trim())
+    if (value === '需返工' || value === '返工') return 'rework'
+    if (value === '通过') pass = true
+  }
+  return pass ? 'pass' : 'unknown'
+}
+
+/** Read this review's conclusion from `<taskDir>/review.md`; a missing or unreadable file is `unknown`, never a pass. */
+export function readReviewConclusion(taskDir: string): NonNullable<Delegation['reviewConclusion']> {
+  try { return parseReviewConclusion(readFileSync(join(taskDir, 'review.md'), 'utf8')) }
+  catch { return 'unknown' }
+}
+
+/**
  * Attribute a run directory to this dispatch: by real path it must be a direct child of `<taskDir>/runs/`, and its name
  * must not have existed in the dispatch-time snapshot. Anything else, including a nested historical directory such as
  * `runs/old/cached`, is not this dispatch's own run. Returns the verified real path, not the caller's raw string.

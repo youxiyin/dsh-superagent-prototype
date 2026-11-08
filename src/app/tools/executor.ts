@@ -126,7 +126,14 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
               }
             }
           }
-          const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+          // A forced pass stays visible in the stored report, its relay, and the final reply; never swallow the override.
+          const overrides = args.state === 'ready'
+            ? (host.store.tickets.get(ticketId)?.delegations ?? []).filter(item => item.overrideReason)
+            : []
+          const summary = args.summary + (overrides.length
+            ? `\n\nFleet delegation overrideReason:\n${overrides.map(item => `- ${item.id}: ${item.overrideReason}`).join('\n')}` : '')
+          if (summary.length > maxChars) throw new Error(`Report has ${summary.length} characters; maximum is ${maxChars}. Shorten the summary and resubmit; no report was recorded.`)
+          const report = { state: args.state, summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)

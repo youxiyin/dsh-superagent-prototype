@@ -96,8 +96,8 @@ it('passes literal argv through real Commands.execFile without shell expansion',
   h.runtime.store.tickets.save({ ...current, delegations: [{
     id: 'test-card', chain: '@complex', taskDir: join(directory, '.fleet', 'tasks', 'test-card'), role: 'builder',
     jobId: 'fleet-0', state: 'reviewed', producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' },
-    critic: { worker: 'codex', family: 'gpt' }, reviewJobId: 'fleet-1', verdict: '' as Delegation['verdict'],
-    reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now',
+    critic: { worker: 'codex', family: 'gpt' }, reviewJobId: 'fleet-1', reviewConclusion: 'pass',
+    verdict: '' as Delegation['verdict'], reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now',
   }] })
   for (const args of [['ls'], ['status'], ['critics', '--producer-family', 'codex'], ['verdict', join(directory, '.fleet', 'tasks', 'test-card'), 'pass']]) {
     await call(args)
@@ -292,6 +292,26 @@ describe('delegation placeholders, attribution and review prechecks', () => {
     expect(record()).toMatchObject({ critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1 })
   })
 
+  it.each([
+    { conclusion: 'pass', review: '## 结论：通过\n' },
+    { conclusion: 'rework', review: '## 结论：需返工\n' },
+    { conclusion: 'unknown', review: undefined },
+  ])('records $conclusion from review.md when the review job finishes', async ({ conclusion, review }) => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id)
+    if (review !== undefined) writeFileSync(join(task, 'review.md'), review)
+    const pending = Promise.withResolvers<string>()
+    vi.mocked(Commands.prototype.run).mockImplementation(async (_bin, args) =>
+      args[0] === 'critics' ? '评审证据（生产族 moonshot）：\ncodex｜family=gpt｜pool=p｜critic自检=ok' : pending.promise)
+    await call(['review', task])
+    const runDir = join(task, 'runs', '20261108-120000-codex-critic'); mkdirSync(runDir, { recursive: true })
+    writeFileSync(join(runDir, 'meta.json'), JSON.stringify({ status: 'done', worker: 'codex', family: 'gpt', role: 'critic', report_exists: true }))
+    pending.resolve(`done｜1.00 秒｜report.md 有｜${runDir}`)
+    const record = () => h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)
+    await vi.waitFor(() => expect(record()?.state).toBe('reviewed'))
+    expect(record()).toMatchObject({ reviewConclusion: conclusion })
+  })
+
   it('retries a failed review and binds the retry to its own job', async () => {
     const { call, task, ticket } = await worker()
     seed(ticket.id)
@@ -395,7 +415,7 @@ describe('verdict gate and exit-code fidelity', () => {
   const recorded = (patch: Partial<Delegation>): Delegation => ({
     id: 'test-card', chain: '@complex', taskDir: '/tmp/test-card', role: 'builder', jobId: 'fleet-0', state: 'reviewed',
     producer: { worker: 'kimi-k3-1-pro', family: 'moonshot' }, critic: { worker: 'codex', family: 'gpt' }, reviewJobId: 'fleet-1',
-    verdict: '' as Delegation['verdict'], reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now', ...patch,
+    reviewConclusion: 'pass', verdict: '' as Delegation['verdict'], reviewRounds: 1, errorClass: '', startedAt: 'now', endedAt: 'now', ...patch,
   })
   const seed = (ticketId: string, patch: Partial<Delegation> = {}) => {
     const current = h.runtime.store.tickets.get(ticketId)!
@@ -422,6 +442,65 @@ describe('verdict gate and exit-code fidelity', () => {
     seed(ticket.id, { state: 'reviewed', critic: { worker: 'kimi-k3-1-pro', family: 'moonshot' } })
     await expect(call(['verdict', task, 'pass'])).rejects.toThrow(/异族|评审/)
     expect(run).not.toHaveBeenCalled()
+  })
+
+  it('allows a pass review without an override and leaves overrideReason absent', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id)
+    vi.mocked(Commands.prototype.run).mockResolvedValue('pass recorded')
+    await call(['verdict', task, 'pass'])
+    const record = h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)
+    expect(record).toMatchObject({ state: 'verdicted', verdict: 'pass', reviewConclusion: 'pass' })
+    expect(record).not.toHaveProperty('overrideReason')
+  })
+
+  it('rejects a rework review pass without an actual override option', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { reviewConclusion: 'rework' })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['verdict', task, 'pass'])).rejects.toThrow(/rework|返工/)
+    // Another option's value is not an override, even when it spells the flag.
+    await expect(call(['verdict', task, 'pass', '--note', '--override-reason'])).rejects.toThrow(/rework|返工/)
+    expect(run).not.toHaveBeenCalled()
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'reviewed', verdict: '' })
+  })
+
+  it('passes a rework review with an override and records its reason verbatim', async () => {
+    const { call, task, ticket, directory } = await worker()
+    seed(ticket.id, { reviewConclusion: 'rework' })
+    const reason = '  Evidence accepts the documented residual risk.  '
+    const run = vi.mocked(Commands.prototype.run); run.mockResolvedValue('pass recorded')
+    await call(['verdict', task, 'pass', '--override-reason', reason])
+    expect(run).toHaveBeenCalledWith('fleet', ['verdict', task, 'pass', '--override-reason', reason], directory)
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({
+      state: 'verdicted', verdict: 'pass', reviewConclusion: 'rework', overrideReason: reason,
+    })
+  })
+
+  it.each([{ conclusion: 'unknown' as const }, { conclusion: undefined }])('rejects a $conclusion review conclusion even with an override', async ({ conclusion }) => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { reviewConclusion: conclusion })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['verdict', task, 'pass', '--override-reason', 'evidence'])).rejects.toThrow(/unknown|结论行/)
+    expect(run).not.toHaveBeenCalled()
+    expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'reviewed', verdict: '' })
+  })
+
+  it('appends only recorded override reasons to the ready report summary and relay', async () => {
+    const { ticket, sessionId } = await worker()
+    const reason = '  Evidence accepts the documented residual risk.  '
+    seed(ticket.id, { state: 'verdicted', verdict: 'pass', reviewConclusion: 'rework', overrideReason: reason })
+    const current = h.runtime.store.tickets.get(ticket.id)!
+    const plain = recorded({ id: 'plain-card', state: 'verdicted', verdict: 'pass' })
+    h.runtime.store.tickets.save({ ...current, delegations: [current.delegations![0]!, plain] })
+    const relay = vi.spyOn(h.runtime.sessions, 'relay')
+    await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' })
+    const expected = `Done.\n\nFleet delegation overrideReason:\n- test-card: ${reason}`
+    expect(h.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.report?.summary).toBe(expected)
+    expect(expected).not.toContain('plain-card')
+    expect(relay).toHaveBeenCalledWith(expect.any(String), expect.stringContaining(reason.trim()))
+    expect(relay).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('test-card'))
+    expect(relay).not.toHaveBeenCalledWith(expect.any(String), expect.stringContaining('plain-card'))
   })
 
   it('allows rework on a failed delegation once it is no longer in flight', async () => {

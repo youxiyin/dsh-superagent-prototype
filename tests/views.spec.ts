@@ -8,11 +8,13 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { snapshot, threadSummary, ticketSummary, triggerView } from '../src/app/views/records.ts'
-import { basisFacts, ticketDetail } from '../src/app/views/tickets.ts'
+import { basisFacts, executorLoad, ticketDetail } from '../src/app/views/tickets.ts'
 import { threadDetail } from '../src/app/views/threads.ts'
 import { droppedReplies, sourcesStatus } from '../src/app/views/sources.ts'
 import { overview } from '../src/app/views/overview.ts'
 import { markdown, plain } from '../src/app/views/text.ts'
+import { FLEET_STATS_TIMEOUT_MS, fleetStats, settingsView } from '../src/app/views/settings.ts'
+import type { Delegation } from '../src/core/model.ts'
 import { policyHistory } from '../src/app/settings-history.ts'
 import { KV } from '../src/kv.ts'
 import { feishuLink } from '../src/sources/feishu-channel.ts'
@@ -318,4 +320,77 @@ it('reads each ticket a page\'s follow-ups reached once, and nothing for a messa
   const records = { tickets: { get: vi.fn() }, threads: { get: vi.fn() }, triggers: store.triggers }
   expect(followupOwners(store.triggers.get('f3')!, records)).toEqual([])
   expect([records.tickets.get, records.threads.get].map(read => read.mock.calls.length)).toEqual([0, 0])
+})
+
+const delegation = (fields: Partial<Delegation> = {}): Delegation => ({
+  id: 'card-1', chain: 'code', taskDir: '/w/t1/.fleet/tasks/card-1', role: 'builder', jobId: 'job-1', state: 'running',
+  producer: { worker: 'kimi-k3', family: 'moonshot' }, critic: { worker: 'codex', family: 'gpt' }, reviewJobId: 'job-2',
+  verdict: '' as Delegation['verdict'], reviewRounds: 1, errorClass: '', startedAt: at, endedAt: '', ...fields,
+})
+
+it('counts delegation stages exactly as ticketStage does and reports only records awaiting a verdict', () => {
+  const host = views()
+  for (const id of ['t1', 't2', 't3', 't4', 't5']) live(id)
+  const ticket = (id: string) => store.tickets.get(id)!
+  store.tickets.save({ ...ticket('t1'), delegations: [delegation({ id: 'running', state: 'running' })] })
+  store.tickets.save({ ...ticket('t2'), delegations: [delegation({ id: 'reviewing', state: 'reviewing' })] })
+  // A ready Assignment takes precedence over delegation activity, just as it does on every Ticket row.
+  store.tickets.save({ ...ticket('t3'), assignments: [{ id: 'a3', state: 'running', createdAt: at, startedAt: at,
+    report: { state: 'ready', summary: 'done', at } }], delegations: [delegation({ id: 'reported', state: 'reported' }),
+      delegation({ id: 'reviewed', state: 'reviewed' })] })
+  store.tickets.save({ ...ticket('t4'), delegations: [delegation({ id: 'passed', state: 'verdicted', verdict: 'pass' })] })
+  store.tickets.save({ ...ticket('t5'), ended: { at, by: 'executor', outcome: 'completed' },
+    delegations: [delegation({ id: 'ended', state: 'running' })] })
+  expect(overview(host, {}, 'v1', executorLoad(store, 0)).executor.delegationStats).toEqual({ delegating: 1, reviewing: 1,
+    awaitingVerdict: 2 })
+})
+
+it('projects delegation identities only when present and marks errors, exhausted rounds and rework as problems', () => {
+  const host = views()
+  live('t1')
+  expect(ticketDetail(host, 't1')).not.toHaveProperty('delegations')
+  store.tickets.save({ ...store.tickets.get('t1')!, delegations: [
+    delegation({ id: 'healthy', state: 'verdicted', verdict: 'pass', note: 'fleet 建议拆成阶段卡' }),
+    delegation({ id: 'error', state: 'failed', errorClass: 'network-down' }),
+    delegation({ id: 'rounds', state: 'reviewed', reviewRounds: 3 }),
+    delegation({ id: 'rework', state: 'verdicted', verdict: 'rework' }),
+  ] })
+  const page = ticketDetail(host, 't1')!
+  expect(page.delegations?.map(item => [item.id, item.problem])).toEqual([['healthy', false], ['error', true], ['rounds', true],
+    ['rework', true]])
+  expect(page.delegations?.[0]).toMatchObject({ chain: 'code', producer: { worker: 'kimi-k3', family: 'moonshot' },
+    critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1, verdict: 'pass', errorClass: '', note: 'fleet 建议拆成阶段卡' })
+})
+
+it('reads cost only from fleet stats with a short timeout and degrades empty, failed or oversized reads to unknown', async () => {
+  const run = vi.fn()
+  run.mockResolvedValueOnce({ stdout: '  Runs: 4\nCost: $2.50\n' }).mockResolvedValueOnce({ stdout: ' \n' })
+    .mockRejectedValueOnce(new Error('fleet missing')).mockRejectedValueOnce(new Error('maxBuffer exceeded'))
+  await expect(fleetStats('/opt/fleet', run)).resolves.toEqual({ summary: 'Runs: 4\nCost: $2.50' })
+  await expect(fleetStats('/opt/fleet', run)).resolves.toEqual({ summary: null })
+  await expect(fleetStats('/opt/fleet', run)).resolves.toEqual({ summary: null })
+  await expect(fleetStats('/opt/fleet', run)).resolves.toEqual({ summary: null })
+  for (const call of run.mock.calls) expect(call).toEqual(['/opt/fleet', ['stats'],
+    { timeout: 1500, maxBuffer: 65536, killSignal: 'SIGKILL' }])
+})
+
+it('settles an unresponsive fleet stats read as unknown at the hard deadline', async () => {
+  vi.useFakeTimers()
+  try {
+    const run = vi.fn(() => new Promise<{ stdout: string }>(() => {}))
+    const observed = vi.fn()
+    const reading = fleetStats('/opt/fleet', run).then(value => { observed(value); return value })
+    await vi.advanceTimersByTimeAsync(FLEET_STATS_TIMEOUT_MS - 1)
+    expect(observed).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(reading).resolves.toEqual({ summary: null })
+  } finally { vi.useRealTimers() }
+})
+
+it('passes fleet stats through Settings without mixing them into the saved Executor block', () => {
+  const host = views()
+  const page = settingsView(host.store, host.sources, {}, {}, '/state', { summary: 'Cost: $2.50' })
+  expect(page.stats).toEqual({ summary: 'Cost: $2.50' })
+  expect(page.blocks.executor.value).not.toHaveProperty('stats')
+  expect(settingsView(host.store, host.sources, {}, {}, '/state')).not.toHaveProperty('stats')
 })
