@@ -7,6 +7,8 @@ type Expect<T extends true> = T
 type _State = Expect<Equal<Delegation['state'], 'carded' | 'running' | 'reported' | 'reviewing' | 'reviewed' | 'verdicted' | 'failed'>>
 type _Role = Expect<Equal<Delegation['role'], 'builder' | 'reader' | 'mass'>>
 type _Verdict = Expect<Equal<Delegation['verdict'], 'pass' | 'rework' | 'escalate' | 'close'>>
+type _ReviewConclusion = Expect<Equal<Delegation['reviewConclusion'], 'pass' | 'rework' | 'unknown' | undefined>>
+type _OverrideReason = Expect<Equal<Delegation['overrideReason'], string | undefined>>
 
 describe('Delegation', () => {
   it('attaches a fully typed delegation to a ticket without requiring a display note', () => {
@@ -20,7 +22,9 @@ describe('Delegation', () => {
       producer: { worker: 'builder-worker', family: 'family-a', routeId: 'route-a', model: 'model-a' },
       critic: { worker: 'critic-worker', family: 'family-b' },
       reviewJobId: 'fleet-2',
+      reviewConclusion: 'pass',
       verdict: 'pass',
+      overrideReason: 'Documented residual risk.',
       reviewRounds: 1,
       errorClass: '',
       startedAt: '2026-11-05T00:00:00.000Z',

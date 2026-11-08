@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { fleetArgv, withHostFleetOptions } from '../src/app/tools/fleet.ts'
-import { attributeRunDir, knownRunDirs, parseCriticCandidates, readCriticCandidates, readRunOutcome, recordDelegation, runDirFromStdout } from '../src/app/tools/fleet-delegation.ts'
+import { attributeRunDir, knownRunDirs, parseCriticCandidates, parseReviewConclusion, readCriticCandidates, readReviewConclusion, readRunOutcome, recordDelegation, runDirFromStdout } from '../src/app/tools/fleet-delegation.ts'
 import type { Delegation, Ticket } from '../src/core/model.ts'
 
-const directory = process.cwd()
+const directory = mkdtempSync(join(tmpdir(), 'fleet-argv-'))
+mkdirSync(join(directory, '.fleet', 'tasks', '20261105-fleet-tool-gate'), { recursive: true })
 const task = join(directory, '.fleet', 'tasks', '20261105-fleet-tool-gate')
 
 describe('fleetArgv chain types and host-only options', () => {
@@ -40,6 +41,65 @@ describe('fleetArgv chain types and host-only options', () => {
     expect(() => fleetArgv(['run', '@code', task, '--role', 'critic'], directory)).toThrow('role')
     expect(() => fleetArgv(['critics'], directory)).toThrow('Missing fleet option')
     expect(fleetArgv(['critics', '--producer-family', 'moonshot'], directory)).toEqual(['critics', '--producer-family', 'moonshot'])
+  })
+
+  it('accepts a non-empty one-line override reason verbatim and rejects invalid values and flags', () => {
+    const reason = '  evidence supports the remaining risk  '
+    expect(fleetArgv(['verdict', task, 'pass', '--override-reason', reason], directory))
+      .toEqual(['verdict', task, 'pass', '--override-reason', reason])
+    expect(fleetArgv(['verdict', task, 'pass', `--override-reason=${reason}`], directory))
+      .toEqual(['verdict', task, 'pass', `--override-reason=${reason}`])
+    for (const value of ['', ' \t ', 'a\nb', 'a\rb', 'a\0b']) {
+      expect(() => fleetArgv(['verdict', task, 'pass', '--override-reason', value], directory)).toThrow()
+    }
+    expect(() => fleetArgv(['verdict', task, 'pass', '--override-reason'], directory)).toThrow()
+    expect(() => fleetArgv(['verdict', task, 'pass', '--override-reasonx', 'value'], directory)).toThrow('not allowed')
+  })
+})
+
+describe('review conclusion evidence', () => {
+  it('parses pass and rework conclusions with rework winning every conflict', () => {
+    expect(parseReviewConclusion('## 结论：通过\n没有发现问题')).toBe('pass')
+    expect(parseReviewConclusion('## 结论：需返工\n有问题')).toBe('rework')
+    expect(parseReviewConclusion('## 结论：返工')).toBe('rework')
+    expect(parseReviewConclusion('## 结论：通过\n## 结论：需返工')).toBe('rework')
+    expect(parseReviewConclusion('## 结论：返工\n## 结论：通过')).toBe('rework')
+  })
+
+  it('normalizes headings, whitespace, colons and emphasis around the line and value', () => {
+    expect(parseReviewConclusion('  ### **结论 ： 通过**')).toBe('pass')
+    expect(parseReviewConclusion('## *结论: 需返工*')).toBe('rework')
+    expect(parseReviewConclusion('_结论：返工_')).toBe('rework')
+    expect(parseReviewConclusion('## 结论：**通过**')).toBe('pass')
+    expect(parseReviewConclusion('## 结论： *需返工* ')).toBe('rework')
+    expect(parseReviewConclusion('## 结论：_返工_')).toBe('rework')
+  })
+
+  it('ignores malformed labels and non-exact or empty conclusion values', () => {
+    for (const input of ['## 结论 通过', '## 总结：通过', '## 结论：', '## 结论：通过。', '## 结论：建议返工']) {
+      expect(parseReviewConclusion(input), input).toBe('unknown')
+    }
+  })
+
+  it.each([
+    ['不通过', '## 结论：不通过'],
+    ['未通过', '## 结论：未通过'],
+    ['不建议通过', '## 结论：不建议通过'],
+    ['无需返工', '## 结论：无需返工'],
+    ['模板原文', '## 结论：通过 / 需返工'],
+    ['附条件通过', '## 结论：通过（附条件）'],
+    ['正文含通过但无结论行', '## 问题\n这段代码可以通过测试'],
+  ])('rejects negated, reserved, template, conditional, and body-only text: %s', (_label, input) => {
+    expect(parseReviewConclusion(input)).toBe('unknown')
+  })
+
+  it('returns unknown without a conclusion line or a readable review file', () => {
+    expect(parseReviewConclusion('通过\n需返工')).toBe('unknown')
+    expect(parseReviewConclusion('## 问题\n尚未形成结论')).toBe('unknown')
+    const root = mkdtempSync(join(tmpdir(), 'fleet-review-conclusion-'))
+    expect(readReviewConclusion(root)).toBe('unknown')
+    writeFileSync(join(root, 'review.md'), '## 结论：通过\n')
+    expect(readReviewConclusion(root)).toBe('pass')
   })
 })
 

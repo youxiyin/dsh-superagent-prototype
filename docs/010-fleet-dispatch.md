@@ -348,6 +348,22 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 
 新增私有模块 `src/app/tools/fleet-delegation.ts`：封装"读 meta.json → 写 delegation → 判定终态"的逻辑，避免 `fleet.ts` 继续膨胀。它导出 `readRunOutcome(taskDir, runDir?)` 读 run 目录的 `meta.json`（没有显式 run 目录时返回 `errorClass: 'missing-run-dir'`，不回落最新目录；meta 缺失时返回 `status: 'unknown'` 而不抛错）、`attributeRunDir(taskDir, runDir, known)` 用真实路径与派工快照判定一个 run 目录是否属于本次派工、`runDirFromStdout(stdout)` 从 `fleet run` 的输出行里取回本次 run 的目录、`parseCriticCandidates(stdout)` 解析 `fleet critics` 的候选（跳过标记为 `过期` 的行）、`readCriticCandidates(bin, producerFamily, cwd, run)` 在显式工作目录下调 `fleet critics` 并在无可派候选时抛错。委派记录由 `recordDelegation(...)` 写入，写入必须发生在事务内——`ResourceHost.store` 没有 `atomic`，所以 `fleetTools` 要多收一个事务函数参数，由 `executorTools` 传 `host.atomic`。
 
+**评审结论证据闸（P0 收口）**：宿主不替评审下结论，但必须读得出结论。评审 job 结束后，宿主读该卡的 `review.md`，解析出 `reviewConclusion`：`pass` / `rework` / `unknown`。先判「需返工 / 返工」再判「通过」，两者都没有就是 `unknown`——**没有结论行不等于通过**；冲突时「需返工」优先，后出现的「通过」不能把负面评审翻绿。
+
+**结论行的读法是严格的，不是全文搜词**（异族评审在 P0 收口时查出的真缺陷：宽松子串匹配会把「结论：不通过」读成 `pass`、把「结论：无需返工」读成 `rework`，假绿换一个入口复活）。规则：
+
+- 逐行处理：去行首空白、去行首 Markdown 标题标记（`#` 及其后空格）、去整行首尾的强调标记（`**` / `*` / `_`）。
+- 剩下的文本必须形如 `结论` + 可选空白 + `：`/`:` + 值；取到的值去掉首尾空白与首尾强调标记后，必须**精确等于** `通过` / `需返工` / `返工` 之一，才算一条有效结论。
+- 其余取值一律**不是**结论：`不通过`、`未通过`、`不建议通过`、`无需返工`、`建议返工`、`通过 / 需返工`（模板原文）、`通过（附条件）`、空值、带标点的值。它们不贡献任何结论，因此整篇没有有效结论行时结果是 `unknown`。
+- 判定优先级不变：有效结论行里有 `需返工`/`返工` → `rework`；否则有 `通过` → `pass`；一条有效结论行都没有 → `unknown`。
+- 严格不等于「把正常评审也判没」：fleet 的标准结论行 `## 结论：通过` / `## 结论：需返工` 及其无标题、无强调的变体必须仍然被认出来。
+
+裁定闸随之收紧（`verdict` 子命令）：
+
+- `pass` 仍须先满足既有条件（该委派已有**已完成的异族评审**），且 `reviewConclusion` 不得为 `unknown`；`unknown` 一律拒绝，消息点明「评审没有结论行」。
+- `reviewConclusion === 'rework'` 时，`pass` 必须带 `--override-reason`：非空、单行、不含 NUL。理由原文写进委派记录的 `overrideReason`，并出现在就绪报告摘要里（§8.4）——人能看到这次放行是谁、以什么理由放行的。
+- 理由不是自由文本豁免：它不改变评审结论，只把「强行通过」变成一条留痕、可追责的显式动作；`--override-reason` 未经校验（空串、含换行或 NUL）时连同整个裁定一起被拒。
+
 ### 8.2 `src/policy.ts`
 
 `ExecutorConfigSchema.fleet`（`:98-103`）从 4 字段扩为：
@@ -386,9 +402,13 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 
 其他 report 状态（progress / blocked / failed / dropped）不受影响。
 
+**放行理由可见**：工单里有委派带 `overrideReason`（评审要求返工却被强行 `pass`）时，`ready` 报告的摘要追加一段 `Fleet delegation overrideReason:`，逐条列出委派 id 与理由原文。摘要超长按既有 `reportMaxChars` 规则拒绝整份报告，不静默截断——理由进不了人眼就不算留痕。
+
 ### 8.5 `src/core/model.ts`
 
 新增 `Delegation` 接口（§5.1 字段表），`Ticket` 增加 `delegations?: Delegation[]`。
+
+P0 收口另加两个可选字段：`reviewConclusion?: 'pass' | 'rework' | 'unknown'`（宿主解析出的评审结论；旧记录缺该字段时按 `unknown` 处理，不得当成通过）与 `overrideReason?: string`（宿主校验过的放行理由原文，见 §8.1）。
 
 ### 8.6 `src/app/sessions.ts`
 
@@ -411,6 +431,8 @@ superagent 这一侧的收紧仍有价值，区别在**失败得更早、说得�
 这段文本同时是**可被团队编辑的**。因此 §8.1–§8.4 的代码闸是真正的强制点，prompt 只是协作说明。
 
 **这段契约接近 worker 的提示词预算。** P0 为容纳最初的工头契约把 `tests/model-surface.spec.ts` 的 `BUDGET.worker` 从 40_500 提到 **40_800**。返工后的两档措辞必须装在这一上限内，**不得再上调**；净增长靠压缩同段其它句子消化。
+
+**返工协议（P0 收口）**：两份提示词用同一套措辞写明返工动作——评审结论为「需返工」时，先在原卡上记 `rework` 裁定，再**另开新卡**做修复；不在原卡上重试，也不放弃这项工作。强行 `pass` 必须给 `--override-reason` 并附证据，宿主会记录并在最终报告里展示。两份提示词都不出现工具字面名，措辞互为对照。
 
 ### 8.8 面板（对应 [005 Panel](005-panel.md)）
 

@@ -8,7 +8,7 @@ import { workerSessionId } from '../../executor/dsh.ts'
 import type { ResourceHost } from '../resources.ts'
 import type { Sessions } from '../sessions.ts'
 import { CliError } from '../../infra/commands.ts'
-import { attributeRunDir, knownRunDirs, readCriticCandidates, readRunOutcome, recordDelegation, runDirFromStdout, type RunOutcome } from './fleet-delegation.ts'
+import { attributeRunDir, knownRunDirs, readCriticCandidates, readReviewConclusion, readRunOutcome, recordDelegation, runDirFromStdout, type RunOutcome } from './fleet-delegation.ts'
 import { tool, type Tool } from './tool.ts'
 
 const commands = ['card', 'run', 'review', 'verdict', 'ls', 'status', 'critics'] as const
@@ -18,7 +18,7 @@ const chainPattern = /^@[a-z][a-z-]*$/
 const flags: Record<typeof commands[number], Record<string, boolean>> = {
   card: { '--title': true }, run: { '--role': true, '--timeout': true, '--dry-run': false },
   review: { '--critic': true, '--producer-family': true, '--base': true, '--timeout': true, '--dry-run': false },
-  verdict: { '--note': true, '--self-fix-lines': true, '--self-run': false },
+  verdict: { '--note': true, '--self-fix-lines': true, '--self-run': false, '--override-reason': true },
   ls: { '--all': false, '--open': false }, status: {}, critics: { '--producer-family': true },
 }
 /** Host-only options: the model may send them, but they are dropped so the host alone fills them. */
@@ -86,6 +86,8 @@ export function fleetArgv(argv: string[], directory: string): string[] {
   if (options.has('--base') && !/^[A-Za-z0-9_][A-Za-z0-9_./~^@{}-]*$/.test(options.get('--base')!.value)) throw new Error('Invalid review base')
   if (options.has('--role') && !['builder', 'reader', 'mass'].includes(options.get('--role')!.value)) throw new Error('Invalid fleet role')
   for (const flag of ['--timeout', '--self-fix-lines']) if (options.has(flag) && !/^\d+$/.test(options.get(flag)!.value)) throw new Error(`Invalid ${flag}`)
+  const overrideReason = options.get('--override-reason')?.value
+  if (overrideReason !== undefined && (!overrideReason.trim() || /[\r\n\0]/.test(overrideReason))) throw new Error('Invalid --override-reason')
   if (command === 'verdict' && !['pass', 'rework', 'escalate', 'close'].includes(positional[1]!)) throw new Error('Invalid fleet verdict')
   // Rebuild so a stripped host-only option cannot survive, keeping positionals before options.
   const rebuilt = [name!, ...positional]
@@ -101,6 +103,16 @@ export function withHostFleetOptions(argv: string[], options: Record<string, str
   const result = [...argv]
   for (const [flag, value] of Object.entries(options)) result.push(flag, value)
   return result
+}
+
+/** Read the override from canonical verdict argv without mistaking another option's value for a flag. */
+function verdictOverrideReason(argv: string[]): string | undefined {
+  for (let i = 3; i < argv.length; i++) {
+    const [flag, inline] = argv[i]!.split(/=(.*)/s)
+    const value = flags.verdict[flag!] ? inline ?? argv[++i] : undefined
+    if (flag === '--override-reason') return value
+  }
+  return undefined
 }
 
 const iso = (): string => new Date().toISOString()
@@ -189,6 +201,7 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
           (bin, criticArgs, cwd) => host.commands.withSignal(signal).run(bin, criticArgs, cwd))
       }
       const finalArgs = args[0] === 'review' ? withHostFleetOptions(args, { '--critic': '@review' }) : args
+      const overrideReason = args[0] === 'verdict' ? verdictOverrideReason(args) : undefined
       // A verdict may not jump an in-flight delegation, and a pass needs a completed foreign-family review already recorded.
       if (args[0] === 'verdict') {
         const existing = current.delegations?.find(item => item.id === id)
@@ -196,8 +209,17 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
         if (existing.state === 'running' || existing.state === 'reviewing') {
           throw new Error(`The delegation is still in flight; wait for it to finish before a verdict (委派未结束，不能裁定): ${id}`)
         }
-        if (args[2] === 'pass' && (existing.state !== 'reviewed' || !existing.critic.family || existing.critic.family === existing.producer.family)) {
-          throw new Error(`A pass requires a completed foreign-family review (异族评审尚未完成，不能裁定通过): ${id}`)
+        if (args[2] === 'pass') {
+          if (existing.state !== 'reviewed' || !existing.critic.family || existing.critic.family === existing.producer.family) {
+            throw new Error(`A pass requires a completed foreign-family review (异族评审尚未完成，不能裁定通过): ${id}`)
+          }
+          const conclusion = existing.reviewConclusion ?? 'unknown'
+          if (conclusion === 'unknown') {
+            throw new Error(`A pass requires a readable review conclusion; unknown cannot be overridden (评审没有结论行，不能裁定通过): ${id}`)
+          }
+          if (conclusion === 'rework' && overrideReason === undefined) {
+            throw new Error(`The review requires rework; pass needs an evidence-based --override-reason (评审要求返工，强行通过必须给出 override 理由): ${id}`)
+          }
         }
         if (args[2] !== 'pass' && !['reported', 'reviewed', 'failed'].includes(existing.state)) {
           throw new Error(`A ${args[2]} verdict needs a delegation that reported, was reviewed, or failed (该状态不能记录裁定): ${id}`)
@@ -211,6 +233,7 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
             const existing = latest?.delegations?.find(item => item.id === id)
             if (existing) recordDelegation(host, ticket.id, {
               ...existing, verdict: args[2] as Delegation['verdict'], state: 'verdicted', endedAt: iso(),
+              ...(args[2] === 'pass' && overrideReason !== undefined ? { overrideReason } : {}),
             })
           })
         }
@@ -263,6 +286,7 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
             const candidate = runDirFromStdout(stdout)
             const runDir = attributeRunDir(taskDir!, candidate, known)
             const outcome = runDir === undefined ? undefined : readRunOutcome(taskDir!, runDir)
+            const reviewConclusion = args[0] === 'review' ? readReviewConclusion(taskDir!) : undefined
             // A failed command loses stdout, so only its fleet exit code (or `unknown`) remains for the record.
             const failureClass = result.error !== undefined ? exitClass(result.error, exitCode)
               : candidate === undefined ? 'missing-run-dir' : 'unattributed-run'
@@ -305,7 +329,8 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
                   jobId: previous?.jobId ?? '', state: reviewed ? 'reviewed' : 'reported',
                   producer: previous?.producer ?? { worker: '', family: '' },
                   critic: reviewed ? { worker: outcome.worker, family: outcome.family } : { worker: '', family: '' },
-                  reviewJobId: wakeId, verdict: previous?.verdict ?? '' as Delegation['verdict'], reviewRounds: rounds,
+                  reviewJobId: wakeId, reviewConclusion: reviewConclusion ?? 'unknown',
+                  verdict: previous?.verdict ?? '' as Delegation['verdict'], reviewRounds: rounds,
                   errorClass, ...(note ? { note } : {}), startedAt: previous?.startedAt ?? startedAt, endedAt: iso(),
                 })
               }
