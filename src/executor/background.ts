@@ -5,6 +5,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { randomUUID } from 'node:crypto'
 
 /** What the Executor uses of DSH's job registry: the jobs a Session can see, their events, a wait for one and a kill. */
 interface Jobs {
@@ -26,9 +27,70 @@ const DRAIN_LIMIT_MS = 10_000
 /** How long one wait that collects a job's end runs; one that ends with the job running is followed by the next. */
 const COLLECT_WAIT_MS = 10 * 60_000
 
-const registry = (ctx: Context): Jobs | undefined => ctx.get('jobs') as Jobs | undefined
+type HostJob = { id: string; owner: string; label: string; status: string; stop: AbortController;
+  done: Promise<{ status: string }>; waiters: number }
+type HostJobs = { jobs: Map<string, HostJob>; listeners: Set<{ owner: string; listener: (event: { type: string }) => void }> }
+const hostJobs = new WeakMap<Context, HostJobs>()
+const localJobs = (ctx: Context): HostJobs => {
+  let state = hostJobs.get(ctx)
+  if (!state) { state = { jobs: new Map(), listeners: new Set() }; hostJobs.set(ctx, state) }
+  return state
+}
+/** Combine host commands with DSH jobs so idle, handoff, cancellation and shutdown use the same lifecycle. */
+const registry = (ctx: Context): Jobs => {
+  const native = ctx.get('jobs') as Jobs | undefined, local = localJobs(ctx)
+  return {
+    list: caller => [...native?.list(caller) ?? [], ...[...local.jobs.values()].filter(job => job.owner === caller)],
+    async wait(id, ms, caller, signal) {
+      const job = local.jobs.get(id)
+      if (!job) {
+        if (!native) throw new Error('Unknown background job')
+        return native.wait(id, ms, caller, signal)
+      }
+      if (job.owner !== caller) throw new Error('Background job belongs to another Session')
+      job.waiters++
+      try { return await until(job.done, signal, ms) || { status: job.status } }
+      finally { job.waiters-- }
+    },
+    kill(id, caller, reason) {
+      const job = local.jobs.get(id)
+      if (!job) return native?.kill(id, caller, reason)
+      if (job.owner !== caller) throw new Error('Background job belongs to another Session')
+      job.status = 'stopping'; job.stop.abort(reason)
+    },
+    events: { subscribe(filter, listener) {
+      const entry = { owner: filter.owner, listener }, off = native?.events.subscribe(filter, listener)
+      local.listeners.add(entry)
+      return () => { local.listeners.delete(entry); off?.() }
+    } },
+  }
+}
+/** Start a host command without holding the tool call; deliver its result before the idle check can release its slot. */
+export function startBackgroundJob(ctx: Context, owner: string, label: string, run: (signal: AbortSignal) => Promise<string>,
+  wake: (id: string, result: { status: string; stdout?: string; error?: string }) => Promise<void>): string {
+  const state = localJobs(ctx), stop = new AbortController(), id = `fleet-${randomUUID()}`
+  const job: HostJob = { id, owner, label, status: 'running', stop, waiters: 0, done: Promise.resolve({ status: 'running' }) }
+  state.jobs.set(id, job)
+  job.done = Promise.resolve().then(() => { stop.signal.throwIfAborted(); return run(stop.signal) }).then(
+    stdout => ({ status: 'completed', stdout }), error => ({ status: 'failed', error: String(error) }),
+  ).then(async result => {
+    try {
+      if (!stop.signal.aborted && !job.waiters) await wake(id, result)
+    } catch (error) { ctx.logger.warn('Could not deliver fleet job %s: %s', id, String(error)) }
+    finally {
+      job.status = stop.signal.aborted ? 'killed' : result.status
+      state.jobs.delete(id)
+      for (const entry of [...state.listeners]) if (entry.owner === owner) entry.listener({ type: 'settled' })
+    }
+    return { status: job.status }
+  })
+  return id
+}
 const subagentsOf = (ctx: Context): Subagents | undefined => ctx.get('subagents') as Subagents | undefined
 const running = (status: string) => status === 'running' || status === 'stopping'
+/** Host commands enforce their own configured timeout instead of the shell idle limit. */
+export const runningHostJobs = (ctx: Context, sessionId: string, except?: ReadonlySet<string>): string[] =>
+  [...localJobs(ctx).jobs.values()].filter(job => job.owner === sessionId && running(job.status) && !except?.has(job.id)).map(job => job.id)
 /** The jobs the Session owns that run, but those in `except`, such as the ones left to a person. */
 const owned = (jobs: Jobs, sessionId: string, except?: ReadonlySet<string>) =>
   jobs.list(sessionId).filter(job => job.owner === sessionId && running(job.status) && !except?.has(job.id))

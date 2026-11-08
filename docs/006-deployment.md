@@ -94,6 +94,8 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | --- | --- | --- |
 | `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
+| `assistantDir` | no | Absolute path: the working directory of the general-assistant Sessions that answer ordinary conversation and non-repository requests from the main Session and Feishu. Defaults to `~/.dsh/superagent-assistant` |
+| `assistantTimeoutMs` | no | How long one general-assistant turn may take before its caller stops waiting; a Feishu answer posts what it had streamed plus a notice. Between `30000` and `1800000`; defaults to `600000` |
 
 After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 

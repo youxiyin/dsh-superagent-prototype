@@ -44,6 +44,13 @@ export const USER_ERRORS = {
   sourceNotInstalled: ['refused', 'The {source} Source kind is not installed'],
   noLabels: ['refused', 'This Source has no names to refresh'],
   nothingToSync: ['refused', 'The {source} Source\'s part of the Policy has nothing to sync from, or the Source is off or waiting for setup'],
+  chatNeedsConversation: ['refused', 'Ordinary conversation needs a Feishu or local main-Session message'],
+  chatNeedsAddressed: ['refused', 'Only a Feishu direct message, a message that mentions the bot, or a local main-Session message can be answered as ordinary conversation'],
+  chatNeedsTicket: ['refused', 'This message belongs to ticket {tickets}; its worker decides it'],
+  chatDecided: ['refused', 'This message already has a Decision of kind {decision}; answer only an undecided Feishu or local candidate'],
+  chatNoRequest: ['refused', 'There is no local message to answer through the general assistant'],
+  chatEmpty: ['refused', 'The general assistant returned no answer'],
+  chatUnavailable: ['refused', 'The general assistant could not answer: {reason}'],
 } as const satisfies Record<string, readonly ['missing' | 'refused', string]>
 export type UserErrorCode = keyof typeof USER_ERRORS
 

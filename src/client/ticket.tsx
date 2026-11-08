@@ -65,6 +65,28 @@ function Assignments({ ticket }: { ticket: TicketPageView }) {
       sessionId={item.ref} /></div>}
   </li>)}</ul>
 }
+function Delegations({ items }: { items: NonNullable<TicketPageView['delegations']> }) {
+  const { t } = usePanel()
+  return <ul className="dt-list">{items.map(item => <li key={item.id} className={`dt-row${item.problem ? ' dt-att dt-att-error' : ''}`}>
+    <Dot state={item.problem ? 'warning' : 'idle'} label={t(item.problem ? 'delegationNeedsAttention' : 'delegationHealthy')} />
+    <div className="dt-row-main">
+      <div className="dt-row-title">{item.id}</div>
+      <KeyValues rows={[
+        [t('delegationChain'), item.chain],
+        [t('delegationState'), valueLabel(t, 'delegationState', item.state)],
+        [t('delegationProducer'), item.producer.worker || t('empty')],
+        [t('delegationProducerFamily'), item.producer.family || t('empty')],
+        [t('delegationCritic'), item.critic.worker || t('empty')],
+        [t('delegationCriticFamily'), item.critic.family || t('empty')],
+        [t('delegationReviewRounds'), item.reviewRounds],
+        [t('delegationVerdict'), item.verdict ? <Tag tone={item.verdict === 'rework' ? 'danger' : item.verdict === 'pass' ? 'success'
+          : 'neutral'}>{valueLabel(t, 'delegationVerdict', item.verdict)}</Tag> : t('empty')],
+        [t('delegationErrorClass'), item.errorClass || t('empty')],
+      ]} />
+      {item.note && <Hint>{item.note}</Hint>}
+    </div>
+  </li>)}</ul>
+}
 function MandateDetails({ ticket, actor }: { ticket: TicketPageView; actor: string }) {
   const { t, navigate } = usePanel()
   const { mandate, decision } = ticket
@@ -163,6 +185,8 @@ export function TicketPage({ id }: { id: string }) {
         context={thread.context} />)}</ul>
     </Section>}
     <div className="dt-details">
+      {data.delegations && <Details icon="queue" title={`${t('term.delegation')} · ${data.delegations.length}`}
+        open={data.delegations.some(item => item.problem)}><Delegations items={data.delegations} /></Details>}
       {/* A single Assignment adds nothing beyond the status line; list Assignments only once work has been resumed or handed over. */}
       {data.assignments.length > 1 && <Details icon="queue" title={`${t('term.assignment')} · ${data.assignments.length}`} open><Assignments
         ticket={data} /></Details>}

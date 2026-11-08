@@ -124,6 +124,10 @@ export type MandateBasis = Received & { sender?: string; rules?: string[] } & (
 
 /** Immutable authorization produced by an accept decision; execution is bounded by it and it never changes. */
 export interface Mandate {
+  /** Missing on legacy tickets, which always execute as repo tickets. */
+  kind?: 'repo' | 'general'
+  /** Canonical absolute workspace of a general ticket, fixed when accepted. */
+  directory?: string
   strength: Strength
   policyVersion: string
   /** How the gate admitted it, for re-validation and audit. */
@@ -273,6 +277,33 @@ export type TicketEndBy = 'executor' | 'human'
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
 export interface Attention { id: string; question: string; triggerId?: string }
+/** A fleet task delegated by a ticket's Executor, with the actual producer and critic identities recorded by the host. */
+export interface Delegation {
+  id: string
+  chain: string
+  taskDir: string
+  /** The isolated worktree used by this delegation; absent on legacy ticket-directory delegations. */
+  worktree?: string
+  role: 'builder' | 'reader' | 'mass'
+  jobId: string
+  state: 'carded' | 'running' | 'reported' | 'reviewing' | 'reviewed' | 'verdicted' | 'failed' | 'not-started'
+  /** Run attempts on this card; legacy records without this field count as one attempt. */
+  attempts?: number
+  producer: { worker: string; family: string; routeId?: string; model?: string }
+  critic: { worker: string; family: string }
+  reviewJobId: string
+  /** The host-parsed conclusion of the latest review; missing on legacy records, which the verdict gate treats as unknown. */
+  reviewConclusion?: 'pass' | 'rework' | 'unknown'
+  verdict: 'pass' | 'rework' | 'escalate' | 'close'
+  /** The exact, host-validated reason supplied when a pass overrides a rework review. */
+  overrideReason?: string
+  reviewRounds: number
+  errorClass: string
+  /** A host-recorded hint for display only; it takes no part in decisions. */
+  note?: string
+  startedAt: string
+  endedAt: string
+}
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -286,6 +317,9 @@ export interface Ticket {
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
   assignments: Assignment[]
+  delegations?: Delegation[]
+  /** Host-created fleet worktrees by card slug, including cards that have not started running yet. */
+  fleetWorktrees?: Record<string, string>
   inputs: TicketInput[]
   /** Inputs not yet handed to a running assignment. */
   undelivered: string[]

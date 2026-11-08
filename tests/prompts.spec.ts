@@ -75,6 +75,17 @@ it('leaves the UI before-and-after evidence to the delivery requirements, which 
   for (const role of ['orchestrator', 'worker'] as const) expect(composePrompt(config, role)).not.toContain('Before and After visual evidence')
 })
 
+it.each(['work', 'worker-general'])('states the rework and override protocol in %s without naming the host tool', name => {
+  const text = promptFile(name)
+  expect(text).toContain('需返工')
+  expect(text).toContain('record verdict rework on the original card')
+  expect(text).toContain('新卡')
+  expect(text).toContain('never retry on the original card or abandon the work')
+  expect(text).toContain('evidence-based --override-reason')
+  expect(text).toContain('final report')
+  expect(text).not.toContain('orchestrator_fleet')
+})
+
 it.each(['orchestrator', 'worker'] as const)('ends the %s prompt with the fixed handoff rules and the execution environment, and the main Session\'s with its Policy', role => {
   withStore(store => {
     const prompts = promptsOf(store)

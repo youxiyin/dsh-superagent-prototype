@@ -97,6 +97,9 @@ export function OverviewPage() {
         {stat(t('executingLabel'), `${data.executor.running} / ${data.executor.maxWorkers}`)}
         {stat(t('queuedLabel'), data.executor.queued)}
         {stat(t('idleLabel'), data.executor.idle)}
+        {stat(t('delegatingLabel'), data.executor.delegationStats?.delegating ?? 0)}
+        {stat(t('reviewingDelegationsLabel'), data.executor.delegationStats?.reviewing ?? 0)}
+        {stat(t('awaitingVerdictLabel'), data.executor.delegationStats?.awaitingVerdict ?? 0)}
       </div>}
     </Section>
   </>

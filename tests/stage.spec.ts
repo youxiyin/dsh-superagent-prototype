@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { canRetry, ticketStage, type Assignment, type ReportState, type Ticket } from '../src/core/index.ts'
+import { canRetry, ticketStage, type Assignment, type Delegation, type ReportState, type Ticket } from '../src/core/index.ts'
 
 const assignment = (overrides: Partial<Assignment> = {}): Assignment => ({ id: 'a', state: 'running', createdAt: '', ...overrides })
 const reported = (state: ReportState, overrides: Partial<Assignment> = {}) => assignment({ report: { state, summary: '', at: '' }, ...overrides })
 const ticket = (overrides: Partial<Ticket> = {}): Ticket => ({ id: 't', title: 'x', decisionId: 'd', mandate: { strength: 'explicit', policyVersion: 'v', basis: { via: 'listed' }, actor: { source: 'feishu', id: 'ou' }, scope: '' },
   channels: [], assignments: [assignment()], inputs: [], undelivered: [], createdAt: '', updatedAt: '', origin: { triggerId: 'x', triggerIds: ['x'] }, ...overrides })
+const delegation = (state: Delegation['state']): Delegation => ({ id: 'd', chain: 'code', taskDir: '/work/t/.fleet/tasks/d', role: 'builder', jobId: 'j', state,
+  producer: { worker: 'w', family: 'f' }, critic: { worker: 'c', family: 'g' }, reviewJobId: 'r', verdict: 'pass', reviewRounds: 0,
+  errorClass: '', startedAt: '', endedAt: '' })
 const attention = { id: 'q', question: '?' }
 /** A person's message that reached the Ticket after its report. */
 const answered = { inputs: [{ id: 'i', kind: 'trigger' as const, triggerId: 'e', at: 'later', human: true as const }] }
@@ -32,6 +35,34 @@ describe('ticketStage', () => {
     ['a progress Report', ticket({ assignments: [reported('progress')] }), { stage: 'working' }],
     ['an ended Ticket', ticket({ ended, attention, assignments: [reported('failed')] }), { stage: 'ended' }],
   ])('%s', (_name, value, stage) => { expect(ticketStage(value)).toEqual(stage) })
+
+  it.each([
+    ['running', 'delegating'],
+    ['reported', 'delegating'],
+    ['reviewing', 'reviewing'],
+  ] as const)('marks a %s delegation as %s', (state, action) => {
+    expect(ticketStage(ticket({ delegations: [delegation(state)] }))).toEqual({ stage: 'working', action })
+  })
+  it.each(['carded', 'reviewed', 'verdicted', 'failed'] as const)('leaves a %s delegation on the ordinary working stage', state => {
+    expect(ticketStage(ticket({ delegations: [delegation(state)] }))).toEqual({ stage: 'working' })
+  })
+  it('does not mark a not-started delegation as delegating, unlike a running one', () => {
+    expect(ticketStage(ticket({ delegations: [delegation('not-started')] }))).toEqual({ stage: 'working' })
+    expect(ticketStage(ticket({ delegations: [delegation('running')] }))).toEqual({ stage: 'working', action: 'delegating' })
+  })
+  it('keeps the original working stage with no delegations or an empty delegation list', () => {
+    expect(ticketStage(ticket())).toEqual({ stage: 'working' })
+    expect(ticketStage(ticket({ delegations: [] }))).toEqual({ stage: 'working' })
+  })
+  it('keeps person stages ahead of delegations', () => {
+    expect(ticketStage(ticket({ attention, delegations: [delegation('running')] }))).toEqual({ stage: 'person', action: 'answer' })
+    expect(ticketStage(ticket({ assignments: [reported('ready')], delegations: [delegation('reviewing')] })))
+      .toEqual({ stage: 'person', action: 'review' })
+  })
+  it('applies the delegating rule before reviewing', () => {
+    const delegations = [delegation('reviewing'), delegation('running')]
+    expect(ticketStage(ticket({ delegations }))).toEqual({ stage: 'working', action: 'delegating' })
+  })
 })
 
 describe('canRetry', () => {

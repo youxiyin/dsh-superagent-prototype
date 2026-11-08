@@ -1,11 +1,30 @@
 // @vitest-environment jsdom
 // The overview.
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { en, zh } from '../src/client/locales.ts'
 import { usePanel, mount, remount, all, find, tab, click, text } from './fixtures/panel.tsx'
 import { server, droppedReply, threadSummary } from './fixtures/panel-server.ts'
 
 usePanel()
+function withDelegationStats(delegationStats: { delegating: number; reviewing: number; awaitingVerdict: number }) {
+  const original = vi.mocked(fetch).getMockImplementation()!
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    const response = await original(url, init)
+    if (!String(url).endsWith('/overview')) return response
+    const view = JSON.parse(await response.text())
+    return Response.json({ ...view, executor: { ...view.executor, delegationStats } })
+  })
+}
+
+it('shows in-flight delegation stages and verdicts awaiting a person', async () => {
+  withDelegationStats({ delegating: 2, reviewing: 1, awaitingVerdict: 3 })
+  await mount()
+  const stat = (label: string) => all('.dt-stat').find(item => item.querySelector('.dt-stat-label')?.textContent === label)
+  expect(stat(zh.delegatingLabel)?.textContent).toBe(`${zh.delegatingLabel}2`)
+  expect(stat(zh.reviewingDelegationsLabel)?.textContent).toBe(`${zh.reviewingDelegationsLabel}1`)
+  expect(stat(zh.awaitingVerdictLabel)?.textContent).toBe(`${zh.awaitingVerdictLabel}3`)
+})
+
 it('leads the overview with the pending Tickets, then problems, the last day and the Executor, each linking to its stage', async () => {
   await mount()
   expect(tab(zh['tab.overview']).getAttribute('aria-selected')).toBe('true')
@@ -18,7 +37,8 @@ it('leads the overview with the pending Tickets, then problems, the last day and
     && [...row.querySelectorAll('.dt-ticket-actions button, .dt-ticket-actions a')].every(action => action.querySelector('svg')))).toBe(true)
   expect(text()).toContain('来源会在每次轮询时自动重试')
   expect(text()).toContain('需要确认按钮颜色')
-  expect(all('.dt-stat').map(stat => stat.textContent)).toEqual(['到达12', '被过滤2', '已评估5', '接单或续做1', '执行中2 / 3', '排队0', '等待新触发1'])
+  expect(all('.dt-stat').map(stat => stat.textContent)).toEqual(['到达12', '被过滤2', '已评估5', '接单或续做1', '执行中2 / 3', '排队0',
+    '等待新触发1', '委派中0', '委派评审中0', '待裁定0'])
   expect(all('.dt-chip').map(chip => chip.textContent)[0]).toBe('GitHub#42CI 失败1')
   expect(document.querySelector('.dt-chip-problem')?.textContent).toBe('CI 失败1')
   expect(document.querySelector<HTMLAnchorElement>('a.dt-chip-link')?.href).toBe('https://github.com/acme/widgets/pull/42')
@@ -129,7 +149,8 @@ it('shows the overview in English', async () => {
     `${en.lastDay}${en.details}`, `${en['term.executor']}${en.details}`])
   expect(all('.dt-cards .dt-ticket-stage').map(item => item.textContent)).toEqual([en['stage.answer'], en['stage.failed']])
   expect(all('.dt-stat-label').map(label => label.textContent)).toEqual([en.flowReceivedLabel, en.flowFilteredLabel, en.flowJudgedLabel,
-    en.flowAcceptedLabel, en.executingLabel, en.queuedLabel, en.idleLabel])
+    en.flowAcceptedLabel, en.executingLabel, en.queuedLabel, en.idleLabel, en.delegatingLabel, en.reviewingDelegationsLabel,
+    en.awaitingVerdictLabel])
 })
 
 it('lists the unavailable Evals one by one, without the health entry that counts them as a failure of dsh-superagent', async () => {

@@ -56,7 +56,7 @@ const RULES: [rule: string, file: string, says: string[], gone?: string[]][] = [
       'never drop a request silently', 'leave ordinary discussion unanswered']],
   ['A person\'s message resumes an ended ticket without a decision', 'subscriptions', ['a human\'s message there resumes the ticket under the same mandate']],
   ['A thread can have several tickets, and its messages reach all of them', 'orchestrator',
-    ['Messages on a subscribed thread go directly to the workers of its tickets.'], ['go directly to their worker']],
+    ['A person\'s message on a thread a ticket follows goes straight to its workers'], ['go directly to their worker']],
   ['The gate admits a candidate through the admission table in the Source\'s part of the Policy', 'subscriptions',
     ['(an allowed sender\'s mention, the admission table in the Source\'s part of the Policy, or a thread that already has tickets)']],
   ['A question goes back where the person who raised it wrote', 'replies',

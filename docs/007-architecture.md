@@ -324,12 +324,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/effects.ts` | Effects |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
+| `src/app/chat.ts` | `splitChat`: an ordinary-conversation answer as Feishu-sized messages, with open code fences closed and reopened at a split |
 | `src/app/settings.ts` | Settings |
 | `src/app/settings-history.ts` | `policyHistory`: each saved settings revision with what it changed from the one before |
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
+| `src/app/turn.ts` | `findUserMessage`, `turnOfMessage`, `latestLocalRequest`, `activeTurn` and `collectAssistantTurn`: the request, turn boundaries and answer text in a Session's event log |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -342,6 +344,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
+| `src/app/tools/fleet.ts` | Restricted host fleet argv and ticket-directory validation; background run and review |
+| `src/app/tools/fleet-delegation.ts` | A fleet run's `meta.json` as `RunOutcome`, its run directory from stdout, critic candidates, and `recordDelegation` |
+| `src/app/tools/fleet-card.ts` | Parse `card.md` budget fields and acceptance fences; reject an invalid card, chain mismatch or unauthorized free tier before any subprocess |
+| `src/app/tools/fleet-worktree.ts` | A clean detached Git worktree per card under `.fleet/worktrees`, idempotent exclude rule, and the non-repository fallback |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
@@ -360,6 +366,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
 | `src/sources/registry.ts` | `SourceRegistry` |
+| `src/sources/local.ts` | The built-in local Source: main-Session user messages as explicit Triggers, Session Threads, and replies through the existing Session delivery |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
@@ -405,19 +412,30 @@ Some generic modules still refer directly to GitHub or Feishu:
 | --- | --- |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
+| `tests/delegation.spec.ts` | The Delegation domain shape and fleet settings |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
+| `tests/local-source.spec.ts` | Local main-Session intake, explicit routing, stable Threads, the Source switch and lifecycle, and idempotent verbatim replies |
+| `tests/general-ticket.spec.ts` | General-ticket acceptance, canonical directory allowlists, symlink refusals, worker workspaces and sandbox, default directories, and legacy repo behavior |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
+| `tests/fleet-tool.spec.ts` | Fleet command allowlist, directory isolation, registration, argv and background lifecycle |
+| `tests/fleet-delegation.spec.ts` | Fleet run meta, run directories, critic evidence and delegation recording |
+| `tests/fleet-card.spec.ts` | Fleet card fields, acceptance fences, chain matching and free-tier authorization gates |
+| `tests/fleet-worktree.spec.ts` | Per-card Git worktree creation and reuse, exclude idempotence, symlink refusal and non-repository fallback |
+| `tests/relay-verbatim.spec.ts` | Worker report bodies delivered unchanged to local and Feishu Sources |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
 | `tests/outbox.spec.ts` | The Outbox on a running Runtime: messages wait while processing is paused or their Source is not installed |
 | `tests/cache.spec.ts` | `TextCache` |
+| `tests/chat.spec.ts` | `splitChat`: paragraph, line and word boundaries, unbroken text, and code fences across a split |
+| `tests/turn.spec.ts` | The turn readers over settled messages and streamed text, through other turns and past a turn's end |
+| `tests/assistant.spec.ts` | `orchestrator_chat` on a running Runtime: the latest local message, a Feishu answer that settles its candidate, long and timed-out answers, and its refusals |
 | `tests/queue.spec.ts` | The Runtime's work through the effect queue, and what earlier versions stored |
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |

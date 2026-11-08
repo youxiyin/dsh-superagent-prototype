@@ -1,9 +1,9 @@
 /** The Engine's messages to Channels, each by the rule that allows it. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, liveTicket, ticketOutcome } from './model.ts'
+import { latestAssignment, latestReport, liveTicket, ticketOutcome } from './model.ts'
 import type { ChannelRef, Ticket, Trigger } from './model.ts'
-import type { ReplyStatus } from './ports.ts'
+import type { OutboundMessage, ReplyStatus } from './ports.ts'
 import { EnginePart } from './part.ts'
 
 /**
@@ -13,9 +13,12 @@ import { EnginePart } from './part.ts'
  */
 export type ReplyRequest =
   | { purpose: 'acknowledgement'; ticketId: string; triggerId: string; text: string }
+  | { purpose: 'report'; ticketId: string; triggerId?: string }
   | { purpose: 'answer' | 'result' | 'attention'; ticketId?: string; triggerId?: string; question?: string; text: string }
 /** A queued message: its id, whether it went out, and whether an earlier request had queued it already. */
 export interface Reply { id: string; status: ReplyStatus; reused: boolean }
+/** Explicit provenance for a recorded worker body, checked by the Outbox before it is queued. */
+export interface WorkerReportMessage extends OutboundMessage { kind: 'reply'; workerReport: true }
 
 /**
  * Replies writes the Engine's messages to Channels through the Outbox port: an acknowledgement, the answer to a person's
@@ -34,7 +37,28 @@ export class Replies extends EnginePart {
    * that is not ready, completed, merged, or dropped.
    */
   reply(request: ReplyRequest): Reply {
+    if (request.purpose === 'report') return this.report(request.ticketId, request.triggerId)
     return request.purpose === 'acknowledgement' ? this.acknowledge(request) : this.answer(request)
+  }
+  /** Deliver the recorded worker body, without asking the orchestrator to compose another answer. */
+  private report(ticketId: string, triggerId?: string): Reply {
+    const ticket = this.require(ticketId), report = latestReport(ticket)
+    if (!report || report.state === 'waiting' || report.state === 'dropped' || report.state === 'progress' && !triggerId && !ticket.attention) {
+      throw new Error('This report is internal only')
+    }
+    if (triggerId && !ticket.answers?.includes(triggerId)) throw new UserError('noAnswer')
+    const asker = triggerId ? this.repo.triggers.get(triggerId) : ticket.attention?.triggerId
+      ? this.repo.triggers.get(ticket.attention.triggerId) : undefined
+    const channel = asker?.channel ?? this.sourceChannel(ticket)
+    if (!channel) throw new UserError('noChannel')
+    const id = !triggerId && ticket.attention ? key('attention-reply', ticket.attention.id)
+      : key('worker-report', ticket.id, report.at, report.summary)
+    const existing = this.options.outbox.status(id)
+    const question = !triggerId ? ticket.attention?.question : undefined
+    const text = question && !report.summary.includes(question) ? `${report.summary}\n\n${question}` : report.summary
+    const message: WorkerReportMessage = { id, channel, text, kind: 'reply', ticketId, workerReport: true }
+    this.options.outbox.send(message)
+    return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
   }
   /**
    * Queue the acknowledgement an accept carries where the message that started the ticket was written, if it has a Channel
@@ -61,7 +85,7 @@ export class Replies extends EnginePart {
     this.takeUp(ticket.id, trigger.id)
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
   }
-  private answer(request: Exclude<ReplyRequest, { purpose: 'acknowledgement' }>): Reply {
+  private answer(request: Exclude<ReplyRequest, { purpose: 'acknowledgement' | 'report' }>): Reply {
     const trigger = request.triggerId ? this.repo.triggers.get(request.triggerId) : undefined
     if (request.triggerId && !trigger) throw new UserError('unknownTrigger')
     const ticket = request.ticketId ? this.require(request.ticketId)

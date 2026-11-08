@@ -1,12 +1,27 @@
 // @vitest-environment jsdom
 // The Execution status, a Ticket, and the Execution settings.
 import { act } from 'react'
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { en, zh } from '../src/client/locales.ts'
+import type { TicketPageView } from '../src/client/api.ts'
 import { usePanel, mount, remount, all, find, tab, click, type, text, field, at } from './fixtures/panel.tsx'
 import { MEMBER, server, ticketSummary, threadSummary } from './fixtures/panel-server.ts'
 
 usePanel()
+type DelegationView = NonNullable<TicketPageView['delegations']>[number]
+const delegation = (fields: Partial<DelegationView> = {}): DelegationView => ({
+  id: 'card-1', chain: 'code', state: 'verdicted', producer: { worker: 'kimi-k3', family: 'moonshot' },
+  critic: { worker: 'codex', family: 'gpt' }, reviewRounds: 1, verdict: 'pass', errorClass: '', problem: false, ...fields,
+})
+function withFleetStats(summary: string | null) {
+  const original = vi.mocked(fetch).getMockImplementation()!
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    const response = await original(url, init)
+    if (!String(url).endsWith('/settings')) return response
+    const view = JSON.parse(await response.text())
+    return Response.json({ ...view, stats: { summary } })
+  })
+}
 it('lists Tickets under Execution by who they wait on, with the Executor state and its pause as an action', async () => {
   server.tickets.open = [ticketSummary(), ticketSummary({ id: 't2', title: '执行中的工单', threads: [{ key: 'github:7',
     source: 'github', title: '#7 x', facts: { number: { value: '#7' }, autoMerge: { label: { zh: '自动合并', en: 'Auto-merge' },
@@ -221,4 +236,84 @@ it('sends one stop for a double click on Confirm', async () => {
   const confirm = find(zh.confirm)
   await act(async () => { confirm.click(); confirm.click() })
   expect(server.requests.filter(request => request.path === 'tickets/t1/stop')).toHaveLength(1)
+})
+
+it('omits delegations when absent and folds a healthy delegation until its identities are requested', async () => {
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  expect(all('.dt-disclosure-title').map(item => item.textContent)).not.toContain(`${zh['term.delegation']} · 1`)
+  server.ticketDetails.t1 = { ...server.ticketDetails.t1!, delegations: [delegation({ note: 'fleet 建议拆成阶段卡' })] }
+  await remount()
+  const disclosure = find(`${zh['term.delegation']} · 1`, '.dt-disclosure-row')
+  expect(disclosure.getAttribute('aria-expanded')).toBe('false')
+  expect(text()).not.toContain('kimi-k3')
+  await click(disclosure)
+  expect(disclosure.getAttribute('aria-expanded')).toBe('true')
+  const rows = all('.dt-disclosure[data-open] .dt-kv > div').map(row => [row.querySelector('dt')?.textContent,
+    row.querySelector('dd')?.textContent])
+  expect(rows).toEqual(expect.arrayContaining([
+    [zh.delegationChain, 'code'], [zh.delegationProducer, 'kimi-k3'], [zh.delegationProducerFamily, 'moonshot'],
+    [zh.delegationCritic, 'codex'], [zh.delegationCriticFamily, 'gpt'], [zh.delegationReviewRounds, '1'],
+    [zh.delegationVerdict, zh['delegationVerdict.pass']], [zh.delegationErrorClass, zh.empty],
+  ]))
+  expect(text()).toContain('fleet 建议拆成阶段卡')
+  expect(all('.dt-details .dt-att-error')).toHaveLength(0)
+})
+
+it('opens and highlights delegations with errors, exhausted review rounds or a rework verdict', async () => {
+  server.ticketDetails.t1 = { ...server.ticketDetails.t1!, delegations: [
+    delegation({ id: 'error-card', state: 'failed', verdict: '' as DelegationView['verdict'], errorClass: 'network-down', problem: true }),
+    delegation({ id: 'rounds-card', state: 'reviewed', verdict: '' as DelegationView['verdict'], reviewRounds: 3, problem: true }),
+    delegation({ id: 'rework-card', verdict: 'rework', problem: true }),
+  ] }
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  const disclosure = find(`${zh['term.delegation']} · 3`, '.dt-disclosure-row')
+  expect(disclosure.getAttribute('aria-expanded')).toBe('true')
+  expect(all('.dt-details .dt-att-error')).toHaveLength(3)
+  for (const expected of ['error-card', 'rounds-card', 'rework-card', 'network-down', zh['delegationVerdict.rework']])
+    expect(text()).toContain(expected)
+})
+
+it('edits and saves every current fleet field and shows the cost summary returned by fleet stats', async () => {
+  withFleetStats('Runs: 4\nCost: $2.50')
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  expect(text()).toContain('Runs: 4\nCost: $2.50')
+  await click(find(zh.fleetEnabled, '[role="switch"]'))
+  await type(field<HTMLInputElement>(zh.fleetBin), '/opt/fleet')
+  await type(field<HTMLInputElement>(zh.fleetTimeoutMinutes), '181')
+  await type(field<HTMLInputElement>(zh.fleetReportMaxChars), '20001')
+  await type(field<HTMLInputElement>(zh.fleetAllowedChains), 'code, complex survey')
+  await type(field<HTMLInputElement>(zh.fleetDelegationsPerTicket), '3')
+  expect(field<HTMLInputElement>(zh.fleetMaxConcurrent).value).toBe('2')
+  await type(field<HTMLInputElement>(zh.fleetMaxConcurrent), '5')
+  await type(field<HTMLInputElement>(zh.fleetReviewRounds), '4')
+  await click(find(zh.fleetAllowFree, '[role="switch"]'))
+  await type(field<HTMLInputElement>(zh.fleetFreeMaterialSensitivity), 'public, internal')
+  await click(zh.save)
+  const request = server.requests.find(item => item.path === 'settings/executor' && item.method === 'PUT')
+  expect(request?.body).toMatchObject({ value: { fleet: {
+    enabled: true, bin: '/opt/fleet', timeoutMinutes: 181, reportMaxChars: 20001, allowedChains: ['code', 'complex', 'survey'],
+    delegationsPerTicket: 3, maxConcurrent: 5, reviewRounds: 4, allowFree: true, freeMaterialSensitivity: ['public', 'internal'],
+  } } })
+  const submitted = request?.body as { value: { fleet: Record<string, unknown> } }
+  expect(Object.keys(submitted.value.fleet).sort()).toEqual(Object.keys(server.settings.executor.fleet).sort())
+  expect(server.settings.executor.fleet.maxConcurrent).toBe(5)
+  await remount(en)
+  await click(en['tab.execution'])
+  await click(find(en['tab.settings'], '.dt-status-head button'))
+  expect(field<HTMLInputElement>(en.fleetMaxConcurrent).value).toBe('5')
+})
+
+it('shows unknown rather than zero when fleet stats cannot be read', async () => {
+  withFleetStats(null)
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const cost = all('.dt-field').find(item => item.querySelector('.dt-field-head')?.textContent === zh.fleetCost)!
+  expect(cost.textContent).toBe(`${zh.fleetCost}${zh.fleetCostUnavailable}`)
+  expect(cost.textContent).not.toContain('0')
+  expect(cost.querySelector('pre')).toBeNull()
 })

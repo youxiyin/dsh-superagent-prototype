@@ -40,6 +40,10 @@ export class Tickets extends EnginePart {
     // Fall back to the last trigger for Evals recorded before `primary` existed.
     const primary = this.repo.triggers.get(evaluation.primary ?? triggerIds.at(-1)!)
     const origin = { triggerId: primary?.id ?? triggerIds[0]!, triggerIds }
+    mandate = { ...mandate, kind: outcome.ticketKind ?? 'repo',
+      ...(outcome.directory !== undefined ? { directory: outcome.directory } : {}) }
+    if (mandate.kind === 'repo' && mandate.directory !== undefined) throw new Error('directory requires a general ticket')
+    if (mandate.kind === 'general' && !this.options.prepareTicket) throw new Error('General tickets require directory validation by the executor')
     let ticket: Ticket = { id, title: outcome.title, decisionId, mandate, channels: [], assignments: [], inputs: [], undelivered: [],
       createdAt: at, updatedAt: at, origin }
     for (const triggerId of triggerIds) {

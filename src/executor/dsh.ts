@@ -3,13 +3,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { lstatSync, realpathSync, statSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
-import type { Settings } from '../policy.ts'
+import { AbsoluteDirectorySchema, type Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
@@ -17,7 +18,7 @@ import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
-import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { cancelled, collectJob, killJobs, runningHostJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
@@ -55,6 +56,32 @@ export function transient(error: unknown): boolean {
 }
 /** Appends a stable 12-character ticket ID suffix to a validated English worktree name. */
 const ticketWorktreeName = (name: string, id: string): string => `${WorktreeNameSchema.parse(name)}-${id.slice(0, 12)}`
+/** Resolve an existing directory, or its nearest existing ancestor without following a dangling symlink. */
+function canonicalDirectory(directory: string): string {
+  AbsoluteDirectorySchema.parse(directory)
+  try {
+    const canonical = realpathSync(directory)
+    if (!statSync(canonical).isDirectory()) throw new Error(`Not a directory: ${directory}`)
+    return canonical
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if (lstatSync(directory, { throwIfNoEntry: false })) throw new Error(`Unresolved directory symlink: ${directory}`)
+    const parent = dirname(directory)
+    if (parent === directory) throw error
+    return join(canonicalDirectory(parent), directory.slice(parent.length))
+  }
+}
+/** Validate before acceptance or launch, including missing child directories and symlinked ancestors. Does not create files. */
+export function generalDirectory(directory: string, roots: readonly string[]): string {
+  if (!roots.length) throw new Error('General tickets are disabled: executor.generalRoots is empty')
+  const canonical = canonicalDirectory(directory)
+  const allowed = roots.some(root => {
+    const fromRoot = relative(canonicalDirectory(root), canonical)
+    return fromRoot === '' || (!isAbsolute(fromRoot) && fromRoot !== '..' && !fromRoot.startsWith(`..${sep}`))
+  })
+  if (!allowed) throw new Error(`General ticket directory is outside executor.generalRoots: ${canonical}`)
+  return canonical
+}
 /** Host dependencies used by `DshExecutor`. */
 export interface ExecutorHost {
   /** DSH Cordis context: agents and their events, and the subprocess service used to run prepare commands. */
@@ -96,7 +123,8 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
 /** Builds a newly accepted ticket's Execution metadata: its worktree name, workspace directory, and assignment text. */
 export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, settings: Settings,
   stateDir: string): Execution {
-  const name = ticketWorktreeName(outcome.name ?? '', ticket.id)
+  const general = ticket.mandate.kind === 'general'
+  const name = general ? ticket.id : ticketWorktreeName(outcome.name ?? '', ticket.id)
   const source = ticket.origin.triggerId
   const note = outcome.note ? `\nRouting note (not the source request): ${outcome.note}` : ''
   const ruleIds = ticket.mandate.basis.rules
@@ -107,7 +135,9 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
   const assignment = ticket.mandate.strength === 'inferred' && ruleIds
     ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${precedence}${note}`
     : note.trim()
-  return { name, directory: join(executionRoot(settings, stateDir), name), assignment }
+  const directory = general ? generalDirectory(outcome.directory ?? join(settings.executor.generalRoots[0] ?? '', ticket.id),
+    settings.executor.generalRoots) : join(executionRoot(settings, stateDir), name)
+  return { name, directory, assignment }
 }
 /** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
 const ASSIGNMENT_CHARS = 1500, TRIGGER_CHARS = 600
@@ -134,6 +164,8 @@ const RESUMED = 'This ticket ended earlier and the message that follows, on its 
   + 'for another ticket, hand it back with orchestrator_trigger_handback and report dropped; if it needs nothing, such as thanks, '
   + 'report dropped without a message. Report ready when the follow-up is done. Do not repeat completed work.'
 const RETRIED = 'A person retried this ticket. Continue the assignment from the current worktree, git history and PR state.'
+const GENERAL_RESUMED = 'This ticket resumed under the same mandate. Inspect the existing files and results in its directory and continue within its original scope. Hand back requests beyond that scope with orchestrator_trigger_handback. Report ready when done; do not repeat completed work.'
+const GENERAL_RETRIED = 'A person retried this ticket. Continue from the existing files and results in its directory.'
 /** Formats a policy-change input for the worker; inputs recorded before `effect` existed fall back to a general notice. */
 function policyMessage(effect?: PolicyEffect): string {
   if (!effect) return 'Policy change: the access or admission rules changed. Check that the remaining work stays within the assignment.'
@@ -153,12 +185,12 @@ export const inputResource = (ticketId: string, inputId: string): string => `tic
  * a `policy-changed` notice, a `resumed` notice, an orchestrator `note`, or a `text` input as written.
  * Returns `undefined` for legacy `reopen` inputs, which are historical only because the schema 11 migration converted pending reopen inputs into text inputs.
  */
-export function inputMessage(input: TicketInput, trigger?: object): string | undefined {
+export function inputMessage(input: TicketInput, trigger?: object, kind: Mandate['kind'] = 'repo'): string | undefined {
   // Mark triggers arriving on context-only subscriptions so the worker knows they are not addressed to the ticket.
   if (input.kind === 'trigger') return JSON.stringify({ ...trigger ?? { trigger_id: input.triggerId, read: `trigger/${input.triggerId}` },
     ...input.context ? { context: true } : {} })
   if (input.kind === 'policy-changed') return policyMessage(input.effect)
-  if (input.kind === 'resumed') return RESUMED
+  if (input.kind === 'resumed') return kind === 'general' ? GENERAL_RESUMED : RESUMED
   if (input.kind === 'note') return `Note from the orchestrator, for context only: ${input.text}`
   return input.kind === 'text' ? input.text : undefined
 }
@@ -236,7 +268,24 @@ export class DshExecutor implements Executor {
   }
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
-    return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
+    const execution = ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir)
+    return { ...ticket, execution, mandate: { ...ticket.mandate, kind: ticket.mandate.kind ?? 'repo',
+      ...(ticket.mandate.kind === 'general' ? { directory: execution.directory } : {}) } }
+  }
+  /** Recheck the fixed general workspace against current roots before giving its Session more work. */
+  private generalWorkspace(ticket: Ticket): string {
+    const directory = ticket.mandate.directory
+    if (!directory || directory !== ticket.execution?.directory) throw new Error('General ticket has no matching authorized directory')
+    const canonical = generalDirectory(directory, this.host.store.settings().executor.generalRoots)
+    if (canonical !== directory) throw new Error('General ticket directory changed since acceptance')
+    return canonical
+  }
+  private async ensureWorker(ticket: Ticket): Promise<Agent> {
+    const general = ticket.mandate.kind === 'general'
+    const workspace = general ? this.generalWorkspace(ticket) : ticket.execution?.directory ?? ''
+    const agent = await this.host.sessions.ensure(workerSessionId(ticket.id), workspace, ticket.title, 'worker')
+    if (general) this.host.context.permissionPresets.set(agent.session, 'workspace-write')
+    return agent
   }
   /**
    * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
@@ -311,8 +360,8 @@ export class DshExecutor implements Executor {
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
           // Recreate the worker session if it was externally deleted.
-          if (!this.host.context.agents.get(sessionId as SessionId)) {
-            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+          if (ticket.mandate.kind === 'general' || !this.host.context.agents.get(sessionId as SessionId)) {
+            await this.ensureWorker(ticket)
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -333,10 +382,11 @@ export class DshExecutor implements Executor {
       if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) throw new Error('The ticket ended or another Assignment took it over')
       // A stop of the worker's background work that started meanwhile ends with a cancel, which would drop the Input.
       if (this.stopping.has(ticket.id)) throw new Later('The worker\'s background work is stopping')
+      if (current.mandate.kind === 'general') this.generalWorkspace(current)
     }
     live()
     const trigger = input.kind === 'trigger' ? await this.triggerCard(ticket, input.triggerId, input.note) : undefined
-    const message = inputMessage(input, trigger)
+    const message = inputMessage(input, trigger, ticket.mandate.kind)
     if (message === undefined) return
     const text = message.length > ASSIGNMENT_CHARS ? JSON.stringify(capped(message, ASSIGNMENT_CHARS, inputResource(ticket.id, input.id))) : message
     await this.host.sessions.prompt(workerSessionId(ticket.id), input.id, text, 'steer', live)
@@ -432,13 +482,16 @@ export class DshExecutor implements Executor {
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
-    if (!await stat(workspace).then(() => true, () => false)) {
+    if (ticket.mandate.kind === 'general') {
+      await mkdir(this.generalWorkspace(ticket), { recursive: true })
+      this.generalWorkspace(ticket)
+    } else if (!await stat(workspace).then(() => true, () => false)) {
       await this.prepareDirectory(ticket)
       if (!current()) return
     }
     if (!current()) return
     const sessionId = workerSessionId(ticket.id)
-    const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
+    const agent = await this.ensureWorker(ticket)
     if (!current()) return
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
     await this.stopped(ticket.id)
@@ -452,7 +505,8 @@ export class DshExecutor implements Executor {
     const later = ticket.assignments.length > 1
     const told = later && await this.host.sessions.holds(sessionId, first)
     if (!current()) return
-    const retried = ticket.assignments.at(-2)?.endedReason === 'retried' ? { note: RETRIED } : {}
+    const retried = ticket.assignments.at(-2)?.endedReason === 'retried'
+      ? { note: ticket.mandate.kind === 'general' ? GENERAL_RETRIED : RETRIED } : {}
     const assignmentText = ticket.execution?.assignment ?? ''
     const { text: brief, chars, read } = capped(assignmentText, ASSIGNMENT_CHARS, `ticket/${ticket.id}/assignment`)
     const card = told || !source ? undefined : await this.triggerCard(ticket, source.id)
@@ -464,7 +518,10 @@ export class DshExecutor implements Executor {
         ...(batch.length ? { batch } : {}), ...retried })
     const requestId = later ? `assignment:${ticket.id}:${assignment.id}` : first
     await this.host.sessions.prompt(sessionId, requestId, text, 'queue',
-      () => { if (!current()) throw new Error('Launch authorization changed before worker delivery') },
+      () => {
+        if (!current()) throw new Error('Launch authorization changed before worker delivery')
+        if (ticket.mandate.kind === 'general') this.generalWorkspace(ticket)
+      },
       () => { this.host.engine.assignmentStarted(ticket.id, assignment.id) })
     this.host.engine.assignmentStarted(ticket.id, assignment.id)
   }
@@ -635,7 +692,22 @@ export class DshExecutor implements Executor {
     timer.unref?.()
     let quiet: boolean
     const left = this.left.get(ticket.id)?.jobs
-    try { quiet = await untilQuiet(this.host.context, agent, AbortSignal.any([this.host.lifetime, look.signal, limit.signal]), left) }
+    try {
+      quiet = await untilQuiet(this.host.context, agent, AbortSignal.any([this.host.lifetime, look.signal, limit.signal]), left)
+      const hostJobs = runningHostJobs(this.host.context, agent.id, left)
+      if (limit.signal.aborted && !look.signal.aborted && !this.host.closing() && hostJobs.length) {
+        // Fleet commands have their own timeout. Ordinary shell jobs still stop at the idle limit.
+        const except = new Set([...left ?? [], ...hostJobs])
+        const jobs = runningJobs(this.host.context, agent.id, except).map(job => job.name)
+        if (jobs.length) {
+          void this.background(killJobs(this.host.context, agent.id, 'The job ran past its limit', except))
+          const note = `Your background jobs ran ${BACKGROUND_LIMIT_MS / 60_000} minutes after your turn ended and were killed: ${jobs.join(', ')}.`
+          void this.background(this.host.sessions.prompt(agent.id, `killed:${jobs.join(',')}`, note, { inject: 'Background jobs killed' }))
+        }
+        quiet = await untilQuiet(this.host.context, agent, AbortSignal.any([this.host.lifetime, look.signal]), left)
+        if (!quiet) return
+      }
+    }
     finally { clearTimeout(timer); if (this.settling.get(ticket.id) === look) this.settling.delete(ticket.id) }
     const current = live()
     if (this.host.closing() || look.signal.aborted || (!quiet && !limit.signal.aborted) || !current || this.resuming.has(idle.id)) return

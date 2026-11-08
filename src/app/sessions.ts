@@ -1,14 +1,17 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator and worker DSH sessions. */
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { randomUUID } from 'node:crypto'
+import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
+import { assistantPrompt } from './context.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
@@ -19,6 +22,7 @@ import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
+import { activeTurn, collectAssistantTurn, findUserMessage, turnOfMessage } from './turn.ts'
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
@@ -31,6 +35,10 @@ export interface SessionsHost {
   readonly health: HealthEntry
   readonly masterId: string
   readonly lifetime: AbortSignal
+  /** Working directory of the general-assistant Sessions. */
+  readonly assistantDir: string
+  /** Longest a general-assistant turn may take before the caller stops waiting for it. */
+  readonly assistantTimeoutMs: Volatile<number>
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
@@ -46,6 +54,23 @@ interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: 
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+/** The built-in preset a general-assistant Session runs under, with the profile's full tool set. */
+export const ASSISTANT_PRESET = 'standard'
+/** Stable id of the general-assistant Session for one conversation, such as `feishu:<chatId>` or `local:<masterId>`. */
+export const assistantSessionId = (conversation: string): string => `assistant-${key('assistant', conversation)}`
+/** One completed general-assistant exchange; `timedOut` means the answer is incomplete or absent. */
+export interface AssistantAnswer { sessionId: string; text: string; timedOut: boolean; reason?: unknown }
+/** The DSH tools a general-assistant Session works with: the worker's work tools without the ones that message other Sessions. */
+const ASSISTANT_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill',
+  'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models']
+const aborted = (signal: AbortSignal): Error => signal.reason instanceof Error ? signal.reason : new Error('The assistant turn was cancelled')
+const untilAborted = <T>(promise: Promise<T>, signal: AbortSignal): Promise<T> => new Promise((resolve, reject) => {
+  if (signal.aborted) { reject(aborted(signal)); return }
+  const onAbort = () => reject(aborted(signal))
+  signal.addEventListener('abort', onAbort, { once: true })
+  promise.then(value => { signal.removeEventListener('abort', onAbort); resolve(value) },
+    error => { signal.removeEventListener('abort', onAbort); reject(error) })
+})
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -59,7 +84,7 @@ declare module '@deepseek-ai/cordis' {
  * messages other Sessions, or edits documents.
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
-  'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+  'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent', 'orchestrator_fleet']
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -95,6 +120,10 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  /** General-assistant Session ids, which keep their own prompt and tool set instead of the worker limits. */
+  private readonly assistantIds = new Set<string>()
+  /** The tail of each assistant Session's work, so its conversations answer one message at a time in arrival order. */
+  private readonly assistantRuns = new Map<string, Promise<void>>()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
@@ -124,7 +153,8 @@ export class Sessions {
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
+        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : this.assistantIds.has(sessionId) ? ASSISTANT_PRESET
+          : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
@@ -135,14 +165,16 @@ export class Sessions {
     })
   }
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker' | 'assistant'): Promise<Agent> {
     const ctx = this.ctx
+    if (role === 'assistant') mkdirSync(cwd, { recursive: true, mode: 0o700 })
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
-      // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
+      // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml), except the assistant,
+      // which runs the profile's built-in preset to get the full work tools without the orchestrator's routing.
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
-        agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
+        agentPreset: role === 'worker' ? WORKER_PRESET : role === 'assistant' ? ASSISTANT_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
@@ -152,6 +184,92 @@ export class Sessions {
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
+  }
+  /**
+   * Runs one general-assistant turn for `conversation` and returns its answer; a conversation's turns run one at a time in
+   * arrival order, and `signal` abandons the wait, cancelling a turn it already started.
+   * @param conversation - the conversation key, such as `feishu:<chatId>` or `local:<masterId>`.
+   * @param text - the person's message, verbatim.
+   * @param signal - the caller's cancellation.
+   * @returns the answer text, empty or partial when the turn timed out, and the Session that produced it.
+   */
+  async runAssistant(conversation: string, text: string, signal: AbortSignal): Promise<AssistantAnswer> {
+    const sessionId = assistantSessionId(conversation)
+    return this.serialized(sessionId, signal, async () => {
+      // Marked before creation so the agent/created decoration selects the assistant prompt and tools.
+      this.assistantIds.add(sessionId)
+      signal.throwIfAborted()
+      const title = conversation.startsWith('feishu:') ? 'General assistant (Feishu)' : 'General assistant'
+      const agent = await this.ensure(sessionId, this.host.assistantDir, title, 'assistant')
+      signal.throwIfAborted()
+      const events = agent.session.snapshotEvents()
+      const baseline = events.length ? events[events.length - 1]!.seq + 1 : 0
+      const requestId = `assistant:${sessionId}:${randomUUID()}`
+      const messageId = this.promptedId(requestId)
+      await this.prompt(sessionId, requestId, text, 'queue')
+      const answer = await this.waitAssistant(agent, messageId, baseline, signal)
+      return { sessionId, ...answer }
+    })
+  }
+  /** The ids of the general-assistant Sessions this runtime started, which shutdown cancels with the others. */
+  assistantSessions(): string[] { return [...this.assistantIds] }
+  /** Runs `run` after earlier work of `sessionId`, so one conversation's messages answer in order. */
+  private async serialized<T>(sessionId: string, signal: AbortSignal, run: () => Promise<T>): Promise<T> {
+    const previous = this.assistantRuns.get(sessionId) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>(resolve => { release = resolve })
+    const tail = previous.then(() => current)
+    this.assistantRuns.set(sessionId, tail)
+    try {
+      await untilAborted(previous, signal)
+      return await run()
+    } finally {
+      release()
+      if (this.assistantRuns.get(sessionId) === tail) this.assistantRuns.delete(sessionId)
+    }
+  }
+  /**
+   * Waits for the turn that takes the message delivered under `messageId` and returns its text; on timeout it cancels the
+   * turn and returns what it streamed, while a caller's abort cancels it and rejects.
+   */
+  private async waitAssistant(agent: Agent, messageId: MessageId, baseline: number, signal: AbortSignal):
+    Promise<{ text: string; timedOut: boolean; reason?: unknown }> {
+    const timeout = this.host.assistantTimeoutMs.get()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    const idle = agent.whenIdle().then(() => 'idle' as const, () => 'idle' as const)
+    const timed = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), timeout); timer.unref() })
+    const abortedWait = new Promise<never>((_, reject) => {
+      onAbort = () => reject(aborted(signal))
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      const outcome = await Promise.race([idle, timed, abortedWait])
+      const events = agent.session.snapshotEvents()
+      const anchor = findUserMessage(events, messageId, baseline)
+      const turn = anchor === undefined ? undefined : turnOfMessage(events, anchor)
+      if (outcome === 'idle') {
+        return { text: anchor === undefined || turn === undefined ? '' : collectAssistantTurn(events, anchor, turn).text, timedOut: false }
+      }
+      this.abandon(agent, messageId)
+      if (outcome === 'timeout') {
+        const text = anchor === undefined || turn === undefined ? '' : collectAssistantTurn(events, anchor, turn).text
+        return { text, timedOut: true, reason: 'timeout' }
+      }
+      throw aborted(signal)
+    } finally {
+      if (timer) clearTimeout(timer)
+      if (onAbort) signal.removeEventListener('abort', onAbort)
+    }
+  }
+  /** Drops a waiting message, or cancels the turn it started, so an abandoned answer cannot arrive later. */
+  private abandon(agent: Agent, messageId: MessageId): void {
+    if (agent.inbox.remove(messageId)) return
+    const events = agent.session.snapshotEvents()
+    const anchor = findUserMessage(events, messageId)
+    const turn = anchor === undefined ? undefined : turnOfMessage(events, anchor)
+    if (turn !== undefined && activeTurn(events) === turn) agent.cancel({ kind: 'user' }, { keepInbox: false })
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
@@ -231,6 +349,7 @@ export class Sessions {
   }
   private async decorate(agent: Agent): Promise<void> {
     if (this.bindings.has(agent)) return
+    if (this.assistantIds.has(agent.id)) { this.decorateAssistant(agent); return }
     const host = this.host
     const master = agent.id === host.masterId
     const ticket = master ? undefined : this.ticketOf(agent)
@@ -294,6 +413,22 @@ export class Sessions {
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
     })]
+  }
+  /**
+   * A general-assistant Session: the assistant prompt in place of the orchestrator or worker policy, and the profile's work
+   * tools without the ones that ask a person, change the profile, start goals, message other Sessions, or edit documents.
+   */
+  private decorateAssistant(agent: Agent): void {
+    const binding: SessionBinding = { disposers: [] }
+    this.bindings.set(agent, binding)
+    this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
+    if (agent.status === 'idle') this.retryHealth.clear(agent.id)
+    this.updateModelHealth()
+    binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-assistant', order: 9999, interpolate: false,
+      text: assistantPrompt.replaceAll('{{dir}}', this.host.assistantDir) }))
+    const parent = scopeParentOf(agent)
+    const allow = ASSISTANT_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+    if (allow.length) binding.disposers.push(agent.ctx.tools.restrict({ allow }))
   }
   /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's

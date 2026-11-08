@@ -423,3 +423,14 @@ it('takes in what the queue holds after the cursor, once, and moves the cursor a
 9. Write the plugin entry and a loop that waits for setup, follows the switch, moves cursors after `receive`, keeps errors per item, reports health and stops on abort; name the cursors in `KV`.
 10. Add the build entry, the export and the `cordis.patch.yml` insert, and list the module and its spec in the tables of 007.
 11. Test it as `tests/sources.spec.ts` tests the other Sources.
+
+## Local Source
+
+`src/sources/local.ts` is built into `src/index.ts`, without a separate plugin entry. It defaults to enabled; turn off
+`source:local` in Sources settings to stop intake and hold queued replies. After startup and setup, each `user/message`
+event authored by the person in the orchestrator Session becomes a stable Trigger; the Session's agent id identifies its
+Thread and Channel address. The local user is allowed and addresses the agent directly, so candidate cards can be handled
+with `orchestrator_route`. Other Sessions, plugin relays and notices produce no local Triggers. This is a live subscription:
+messages sent before it is ready or while it is off are not backfilled. Channel sends reuse `Sessions.prompt` and its
+persistent message-id deduplication; reply bodies are delivered verbatim. `tests/local-source.spec.ts` covers the complete
+local intake, routing and reply path on the simulated DSH host.

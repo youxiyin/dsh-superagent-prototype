@@ -1,5 +1,6 @@
 /** Reliable outbound message delivery backed by persistent receipts and retried reply effects. */
 import type { OutboundMessage, Outbox as OutboxPort, ReplyStatus } from '../core/index.ts'
+import type { WorkerReportMessage } from '../core/replies.ts'
 import type { Commands } from '../infra/commands.ts'
 import { checkedImText } from '../infra/text.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
@@ -24,9 +25,10 @@ export class Outbox implements OutboxPort {
     host.effects.handle('reply', (_payload, id) => this.deliver(id), { limit: () => host.paused() ? 0 : 1, retry: [5000, 300_000] })
   }
   /** Record a message receipt and enqueue its delivery effect atomically; duplicate message IDs are ignored. */
-  send(message: OutboundMessage): void {
-    // Validate IM reply length here; acknowledgements are already validated when decided.
-    if (message.kind === 'reply' && message.channel.source === 'feishu') checkedImText(message.text)
+  send(message: OutboundMessage | WorkerReportMessage): void {
+    // Worker reports have their own submission limit; ordinary replies retain the IM word limit.
+    const workerReport = 'workerReport' in message && message.workerReport === true
+    if (message.kind === 'reply' && message.channel.source === 'feishu' && !workerReport) checkedImText(message.text)
     const { store, effects } = this.host
     store.atomic(() => { if (store.receipts.add(message)) effects.enqueue('reply', message.id, {}) })
   }
