@@ -1,5 +1,5 @@
 /** Restricted host-side fleet commands for one worker's ticket directory. */
-import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { lstatSync, realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { z } from 'zod'
 import { liveTicket, type Delegation, type Ticket } from '../../core/index.ts'
@@ -8,7 +8,9 @@ import { workerSessionId } from '../../executor/dsh.ts'
 import type { ResourceHost } from '../resources.ts'
 import type { Sessions } from '../sessions.ts'
 import { CliError } from '../../infra/commands.ts'
-import { attributeRunDir, knownRunDirs, readCriticCandidates, readReviewConclusion, readRunOutcome, recordDelegation, runDirFromStdout, type RunOutcome } from './fleet-delegation.ts'
+import { attributeRunDir, knownRunDirs, readCriticCandidates, readReviewConclusion, readRunOutcome, recordDelegation, recordFleetWorktree, runDirFromStdout, type RunOutcome } from './fleet-delegation.ts'
+import { assertFleetCard, readFleetCard } from './fleet-card.ts'
+import { ensureFleetWorktree } from './fleet-worktree.ts'
 import { tool, type Tool } from './tool.ts'
 
 const commands = ['card', 'run', 'review', 'verdict', 'ls', 'status', 'critics'] as const
@@ -24,21 +26,12 @@ const flags: Record<typeof commands[number], Record<string, boolean>> = {
 /** Host-only options: the model may send them, but they are dropped so the host alone fills them. */
 const hostOnly = new Set(['--critic', '--producer-family'])
 
-/** Card facts the free-tier gate reads; an unreadable card is not a free one. */
-function readCard(taskDir: string): { free: boolean; sensitivity?: string } {
-  try {
-    const lines = readFileSync(join(taskDir, 'card.md'), 'utf8').split(/\r?\n/).map(line => line.trim())
-    const sensitivity = lines.map(line => /^- 材料敏感度[:：]\s*(.+)$/.exec(line)?.[1]?.trim()).find(Boolean)
-    return { free: lines.includes('- 免费档：允许'), ...(sensitivity ? { sensitivity } : {}) }
-  } catch { return { free: false } }
-}
-
 /** Validate all CLI operands before invoking Commands; no global options or passthrough flags are accepted. */
-export function fleetArgv(argv: string[], directory: string): string[] {
+export function fleetArgv(argv: string[], directory: string, worktree?: string): string[] {
   const [name, ...rest] = argv
   if (!commands.includes(name as typeof commands[number])) throw new Error('Fleet subcommand is not allowed')
   if (!isAbsolute(directory)) throw new Error('Ticket directory must be absolute')
-  const root = realpathSync(directory)
+  const roots = worktree ? [directory, worktree] : [directory]
   const command = name as typeof commands[number], positional: string[] = []
   const options = new Map<string, { value: string; inline: boolean }>()
   for (let i = 0; i < rest.length; i++) {
@@ -58,17 +51,18 @@ export function fleetArgv(argv: string[], directory: string): string[] {
   if (command === 'ls' && !positional.length) positional.push(directory)
   if (positional.length !== expected) throw new Error(`Invalid operands for fleet ${command}`)
   const project = command === 'card' || command === 'ls' ? positional[0] : undefined
-  if (project !== undefined && project !== directory) throw new Error('Fleet project directory must equal the ticket directory')
+  if (project !== undefined && !roots.includes(project)) throw new Error('Fleet project directory must equal the ticket directory or its registered worktree')
   // Reject even in-project aliases: fleet derives its cwd from the resolved task's grandparents.
   if (command !== 'status' && command !== 'critics') {
-    for (const part of [join(directory, '.fleet'), join(directory, '.fleet', 'tasks')]) {
+    for (const base of roots) for (const part of [join(base, '.fleet'), join(base, '.fleet', 'tasks')]) {
       if (lstatSync(part, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error('Fleet directories cannot be symlinks')
     }
   }
-  const task = command === 'run' ? positional[1] : command === 'review' || command === 'verdict' ? positional[0] : undefined
-  if (task !== undefined && (!isAbsolute(task) || dirname(task) !== join(directory, '.fleet', 'tasks') || realpathSync(task) !== join(root, '.fleet', 'tasks', basename(task)))) {
-    throw new Error('Fleet task directory must belong to the ticket directory')
-  }
+  const taskIndex = command === 'run' ? 1 : command === 'review' || command === 'verdict' ? 0 : undefined
+  const task = taskIndex === undefined ? undefined : positional[taskIndex]
+  const validTask = task !== undefined && isAbsolute(task) && roots.some(base => dirname(task) === join(base, '.fleet', 'tasks')
+    && realpathSync(task) === join(realpathSync(base), '.fleet', 'tasks', basename(task)))
+  if (task !== undefined && !validTask) throw new Error('Fleet task directory must belong to the ticket directory or its registered worktree')
   if (command === 'card' && !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(positional[1]!)) throw new Error('Invalid fleet card slug')
   if (command === 'run' && (!chainPattern.test(positional[0]!) || !chains.has(positional[0]!.slice(1)))) {
     throw new Error('Fleet run takes only a chain type such as @code; do not name a worker (不要指名工人)')
@@ -89,6 +83,10 @@ export function fleetArgv(argv: string[], directory: string): string[] {
   const overrideReason = options.get('--override-reason')?.value
   if (overrideReason !== undefined && (!overrideReason.trim() || /[\r\n\0]/.test(overrideReason))) throw new Error('Invalid --override-reason')
   if (command === 'verdict' && !['pass', 'rework', 'escalate', 'close'].includes(positional[1]!)) throw new Error('Invalid fleet verdict')
+  if (worktree && ['card', 'run', 'review', 'verdict'].includes(command)) {
+    if (command === 'card') positional[0] = worktree
+    if (task !== undefined && taskIndex !== undefined) positional[taskIndex] = join(worktree, '.fleet', 'tasks', basename(task))
+  }
   // Rebuild so a stripped host-only option cannot survive, keeping positionals before options.
   const rebuilt = [name!, ...positional]
   for (const [flag, option] of options) {
@@ -144,6 +142,7 @@ function reviewStateError(state: Delegation['state'], id: string): Error {
     case 'reviewed': return new Error(`This delegation was already reviewed and waits for a verdict (已评审，等待裁定): ${id}`)
     case 'verdicted': return new Error(`This delegation already has a verdict; start a new card to delegate again (已裁定，要重派请换一张新卡): ${id}`)
     case 'failed': return new Error(`This delegation failed and has no output to review (该委派失败，没有可评审的产出): ${id}`)
+    case 'not-started': return new Error(`This delegation has not started and has no output to review; retry the same card (尚未开始，没有可评审的产出): ${id}`)
     default: return new Error(`This delegation is not reviewable in state ${state} (该状态不能发起评审): ${id}`)
   }
 }
@@ -154,7 +153,7 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
   if (!host.store.settings().executor.fleet.enabled) return []
   return [tool({
     name: 'orchestrator_fleet',
-    description: 'Run fleet on the host with argv (subcommand first). Allowed: card/run/review/verdict/ls/status/critics. The run worker slot takes only a chain type (@code/@complex/@bulk/@survey/@zh-text/@visual); do not name a worker. The host arranges the critic from fleet evidence, so do not name a critic either. Project must be DSH_SUPERAGENT_DIR; task directories must be its .fleet/tasks/<id>. run/review return a background job immediately; completion wakes you. No shell, admission bypass or arbitrary flags.',
+    description: 'Run fleet on the host with argv (subcommand first). Allowed: card/run/review/verdict/ls/status/critics. The run worker slot takes only a chain type (@code/@complex/@bulk/@survey/@zh-text/@visual); do not name a worker. The host arranges the critic from fleet evidence, so do not name a critic either. Project must be DSH_SUPERAGENT_DIR or its registered worktree; task directories must be .fleet/tasks/<id> under it. run/review return a background job immediately; completion wakes you. No shell, admission bypass or arbitrary flags.',
     schema: z.object({ argv: z.array(z.string().min(1)).min(1).max(32) }).strict(),
     execute: async ({ argv }, signal) => {
       signal.throwIfAborted()
@@ -162,33 +161,35 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
       if (!config.enabled) throw new Error('Fleet is disabled')
       const current = host.store.tickets.get(ticket.id)
       if (!current || !liveTicket(current) || !current.execution) throw new Error('Fleet requires a live ticket directory')
-      const directory = current.execution.directory, args = fleetArgv(argv, directory)
-      const taskDir = args[0] === 'run' ? args[2]! : args[0] === 'review' || args[0] === 'verdict' ? args[1]! : undefined
-      const id = taskDir === undefined ? '' : basename(taskDir)
-      const startedAt = iso()
-      if (args[0] === 'run') {
-        const chain = args[1]!.slice(1)
-        const allowed = new Set(config.allowedChains.map(value => value.replace(/^@/, '')))
-        if (!allowed.has(chain)) throw new Error(`Fleet chain @${chain} is not allowed here; allowed chains: ${[...allowed].map(value => `@${value}`).join(', ') || '(none)'}`)
-        const delegations = current.delegations ?? []
-        // One delegation is one card: a slug is spent for this ticket, in any state, and a retry takes a new card.
-        if (delegations.some(item => item.id === id)) {
-          throw new Error(`This card (${id}) was already delegated on this ticket; start a new card with fleet card (换一张新卡) instead of reusing it`)
-        }
-        const open = delegations.find(item => item.state !== 'verdicted' && item.state !== 'failed')
-        if (open) throw new Error(`This ticket already has an unreviewed delegation (${open.id}); wait for its verdict before delegating again`)
-        if (delegations.length >= config.delegationsPerTicket) throw new Error(`This ticket has used all ${config.delegationsPerTicket} delegations; report rather than delegate again`)
-        const card = readCard(taskDir!)
-        if (card.free) {
-          if (!config.allowFree) throw new Error('The card asks for the free tier, but executor.fleet.allowFree is off')
-          if (!card.sensitivity || !config.freeMaterialSensitivity.includes(card.sensitivity)) {
-            throw new Error(`The card asks for the free tier, but its material sensitivity (${card.sensitivity ?? 'missing'}) is not in executor.fleet.freeMaterialSensitivity`)
-          }
+      const directory = current.execution.directory
+      const requestedTask = argv[0] === 'run' ? argv[2] : argv[0] === 'review' || argv[0] === 'verdict' ? argv[1] : undefined
+      const requestedId = argv[0] === 'card' ? argv[2] : requestedTask ? basename(requestedTask) : undefined
+      const recorded = requestedId ? current.delegations?.find(item => item.id === requestedId) : undefined
+      let worktree = recorded?.worktree ?? (requestedId ? current.fleetWorktrees?.[requestedId] : undefined)
+      let args = fleetArgv(argv, directory, worktree)
+      const isolate = async (id: string): Promise<void> => {
+        if (worktree) return
+        worktree = await ensureFleetWorktree(directory, id,
+          (program, gitArgs, cwd) => host.commands.withSignal(signal).run(program, gitArgs, cwd))
+        if (worktree) {
+          atomic(() => recordFleetWorktree(host, ticket.id, id, worktree!))
+          args = fleetArgv(argv, directory, worktree)
         }
       }
-      // The producer family comes only from the delegation's recorded meta; a review without it has no foreign family to pick.
-      if (args[0] === 'review') {
-        const existing = current.delegations?.find(item => item.id === id)
+      if (args[0] === 'card') await isolate(args[2]!)
+      let taskDir = args[0] === 'run' ? args[2]! : args[0] === 'review' || args[0] === 'verdict' ? args[1]! : undefined
+      const id = taskDir === undefined ? '' : basename(taskDir)
+      const startedAt = iso()
+      // Every transition into an in-flight state uses this admission check inside its placeholder transaction.
+      const checkConcurrency = () => {
+        const inFlight = host.store.tickets.list().flatMap(item => item.delegations ?? [])
+          .filter(item => item.state === 'running' || item.state === 'reviewing').length
+        if (inFlight >= config.maxConcurrent) {
+          throw new Error(`Fleet concurrent delegation limit reached: ${inFlight}/${config.maxConcurrent} in flight; wait for a delegation to finish before starting another delegation or review`)
+        }
+      }
+      const reviewAdmission = (latest: Ticket | undefined): Delegation => {
+        const existing = latest?.delegations?.find(item => item.id === id)
         if (!existing) throw new Error(`There is no delegation to review yet (还没有可评审的委派记录): ${id}`)
         // Spend no subprocess on critics once the host-side round budget is used up.
         if (existing.reviewRounds >= config.reviewRounds) {
@@ -197,7 +198,23 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
         if (existing.state !== 'reported') throw reviewStateError(existing.state, id)
         const producerFamily = existing.producer?.family ?? ''
         if (!producerFamily) throw new Error(`The producer family is unknown; cannot arrange a foreign-family review (生产族未知): ${id}`)
-        await readCriticCandidates(config.bin, producerFamily, directory,
+        checkConcurrency()
+        return existing
+      }
+      if (args[0] === 'run') {
+        const chain = args[1]!.slice(1)
+        const allowed = new Set(config.allowedChains.map(value => value.replace(/^@/, '')))
+        if (!allowed.has(chain)) throw new Error(`Fleet chain @${chain} is not allowed here; allowed chains: ${[...allowed].map(value => `@${value}`).join(', ') || '(none)'}`)
+        // Validate the actual card before Git worktree setup or any fleet subprocess; the host never rewrites it.
+        assertFleetCard(readFleetCard(taskDir!), chain, config)
+        await isolate(id)
+        taskDir = args[2]!
+      }
+      // The producer family comes only from the delegation's recorded meta; a review without it has no foreign family to pick.
+      if (args[0] === 'review') {
+        // Check capacity before critic discovery; the placeholder transaction repeats it after the await.
+        const existing = atomic(() => reviewAdmission(host.store.tickets.get(ticket.id)))
+        await readCriticCandidates(config.bin, existing.producer.family, worktree ?? directory,
           (bin, criticArgs, cwd) => host.commands.withSignal(signal).run(bin, criticArgs, cwd))
       }
       const finalArgs = args[0] === 'review' ? withHostFleetOptions(args, { '--critic': '@review' }) : args
@@ -225,8 +242,9 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
           throw new Error(`A ${args[2]} verdict needs a delegation that reported, was reviewed, or failed (该状态不能记录裁定): ${id}`)
         }
       }
+      const cwd = ['card', 'run', 'review', 'verdict'].includes(args[0]!) ? worktree ?? directory : directory
       if (args[0] !== 'run' && args[0] !== 'review') {
-        const stdout = await host.commands.withSignal(signal).run(config.bin, finalArgs, directory)
+        const stdout = await host.commands.withSignal(signal).run(config.bin, finalArgs, cwd)
         if (args[0] === 'verdict') {
           atomic(() => {
             const latest = host.store.tickets.get(ticket.id)
@@ -237,30 +255,41 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
             })
           })
         }
-        return { stdout }
+        return { stdout, ...(worktree ? { worktree } : {}) }
       }
       const sessionId = workerSessionId(ticket.id)
       // Snapshot the runs that already exist, so completion can tell this dispatch's fresh run from a historical one.
       const known = knownRunDirs(taskDir!)
       if (args[0] === 'run') {
         atomic(() => {
-          if (!host.store.tickets.get(ticket.id)) throw new Error('The ticket ended before the delegation could start')
+          const latest = host.store.tickets.get(ticket.id)
+          if (!latest) throw new Error('The ticket ended before the delegation could start')
+          const delegations = latest.delegations ?? []
+          const previous = delegations.find(item => item.id === id)
+          // A card that never started may be retried twice in total; every other slug is spent and needs a new card.
+          if (previous?.state === 'not-started' && (previous.attempts ?? 1) >= 2) {
+            throw new Error(`This card (${id}) was not started after ${previous.attempts ?? 1} attempts; escalate to a person (升级交人工) instead of running it again`)
+          }
+          if (previous && previous.state !== 'not-started') {
+            throw new Error(`This card (${id}) was already delegated on this ticket; start a new card with fleet card (换一张新卡) instead of reusing it`)
+          }
+          const open = delegations.find(item => item.state !== 'verdicted' && item.state !== 'failed' && item.state !== 'not-started')
+          if (open) throw new Error(`This ticket already has an unreviewed delegation (${open.id}); wait for its verdict before delegating again`)
+          const spent = delegations.filter(item => item.state !== 'not-started').length
+          if (spent >= config.delegationsPerTicket) throw new Error(`This ticket has used all ${config.delegationsPerTicket} delegations; report rather than delegate again`)
+          // Admission and the placeholder are one synchronous transaction: no competing dispatch can pass between them.
+          checkConcurrency()
           recordDelegation(host, ticket.id, {
-            id, chain: args[1]!, taskDir: taskDir!, role: 'builder', jobId: '', state: 'running',
+            id, chain: args[1]!, taskDir: taskDir!, ...(worktree ? { worktree } : {}), role: previous?.role ?? 'builder', jobId: '', state: 'running',
+            attempts: previous ? (previous.attempts ?? 1) + 1 : 1,
             producer: { worker: '', family: '' }, critic: { worker: '', family: '' }, reviewJobId: '',
             verdict: '' as Delegation['verdict'], reviewRounds: 0, errorClass: '', startedAt, endedAt: '',
           })
         })
       } else {
         atomic(() => {
-          const latest = host.store.tickets.get(ticket.id)
-          const existing = latest?.delegations?.find(item => item.id === id)
-          if (!existing) throw new Error(`There is no delegation to review yet (还没有可评审的委派记录): ${id}`)
-          // Re-read the record in the placeholder transaction: a concurrent review may have claimed it since the precheck.
-          if (existing.reviewRounds >= config.reviewRounds) {
-            throw new Error(`Review rounds exhausted (评审轮数已用尽): ${existing.reviewRounds}/${config.reviewRounds}; report escalate to a person (交人工 / escalate) instead of starting another review`)
-          }
-          if (existing.state !== 'reported') throw reviewStateError(existing.state, id)
+          // Revalidate everything after critic discovery: another delegation may have claimed the last slot meanwhile.
+          const existing = reviewAdmission(host.store.tickets.get(ticket.id))
           // Clear the previous attempt's job id here: the retry owns the record now, and the binding below only
           // writes into an empty slot, so a stale id would leave the new job unbound and its callback rejected.
           recordDelegation(host, ticket.id, { ...existing, state: 'reviewing', reviewJobId: '' })
@@ -270,7 +299,7 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
       let exitCode: number | undefined
       const dispatch = async (stop: AbortSignal): Promise<string> => {
         try {
-          return await host.commands.withSignal(stop).run(config.bin, finalArgs, directory, config.timeoutMinutes * 60_000)
+          return await host.commands.withSignal(stop).run(config.bin, finalArgs, cwd, config.timeoutMinutes * 60_000)
         } catch (error) {
           exitCode = error instanceof CliError && typeof error.exitCode === 'number' ? error.exitCode : undefined
           throw error
@@ -290,6 +319,7 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
             // A failed command loses stdout, so only its fleet exit code (or `unknown`) remains for the record.
             const failureClass = result.error !== undefined ? exitClass(result.error, exitCode)
               : candidate === undefined ? 'missing-run-dir' : 'unattributed-run'
+            const notStarted = args[0] === 'run' && result.error !== undefined && failureClass === 'fleet-exit-3'
             atomic(() => {
               const latest = host.store.tickets.get(ticket.id)
               if (!latest) return
@@ -298,15 +328,16 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
               if (args[0] === 'run') {
                 const reported = outcome !== undefined && outcome.status === 'done' && outcome.reportExists && outcome.family !== ''
                 recordDelegation(host, ticket.id, {
-                  id, chain: args[1]!, taskDir: taskDir!, role: outcome ? roleOf(outcome) : previous?.role ?? 'builder', jobId: wakeId,
-                  state: reported ? 'reported' : 'failed',
-                  producer: outcome
+                  id, chain: args[1]!, taskDir: taskDir!, ...(worktree ? { worktree } : {}), role: !notStarted && outcome ? roleOf(outcome) : previous?.role ?? 'builder', jobId: wakeId,
+                  state: notStarted ? 'not-started' : reported ? 'reported' : 'failed', attempts: previous?.attempts ?? 1,
+                  producer: !notStarted && outcome
                     ? { worker: outcome.worker, family: outcome.family,
                       ...(outcome.routeId ? { routeId: outcome.routeId } : {}), ...(outcome.model ? { model: outcome.model } : {}) }
                     : { worker: '', family: '' },
                   critic: { worker: '', family: '' }, reviewJobId: '', verdict: '' as Delegation['verdict'],
-                  reviewRounds: 0, errorClass: reported ? outcome.errorClass ?? '' : outcome ? incompleteClass(outcome) : failureClass,
-                  ...(note ? { note } : {}), startedAt: previous?.startedAt ?? startedAt, endedAt: iso(),
+                  reviewRounds: 0, errorClass: notStarted ? failureClass : reported ? outcome.errorClass ?? '' : outcome ? incompleteClass(outcome) : failureClass,
+                  ...(notStarted ? { note: '尚未开始，可以重试同一张卡' } : note ? { note } : {}),
+                  startedAt: previous?.startedAt ?? startedAt, endedAt: iso(),
                 })
               } else {
                 // Only the job that owns this record may advance it; a superseded callback still wakes the worker below.
@@ -325,8 +356,8 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
                   else errorClass = incompleteClass(outcome)
                 }
                 recordDelegation(host, ticket.id, {
-                  id, chain: previous?.chain ?? 'review', taskDir: taskDir!, role: previous?.role ?? 'builder',
-                  jobId: previous?.jobId ?? '', state: reviewed ? 'reviewed' : 'reported',
+                  id, chain: previous?.chain ?? 'review', taskDir: taskDir!, ...(worktree ? { worktree } : {}), role: previous?.role ?? 'builder',
+                  jobId: previous?.jobId ?? '', state: reviewed ? 'reviewed' : 'reported', attempts: previous?.attempts ?? 1,
                   producer: previous?.producer ?? { worker: '', family: '' },
                   critic: reviewed ? { worker: outcome.worker, family: outcome.family } : { worker: '', family: '' },
                   reviewJobId: wakeId, reviewConclusion: reviewConclusion ?? 'unknown',
@@ -339,10 +370,13 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
           })
       } catch (error) {
         // A placeholder must never stay in flight when the job could not start.
+        const failureClass = exitClass(error, error instanceof CliError ? error.exitCode : exitCode)
+        const notStarted = args[0] === 'run' && failureClass === 'fleet-exit-3'
         atomic(() => {
           const latest = host.store.tickets.get(ticket.id)
           const existing = latest?.delegations?.find(item => item.id === id)
-          if (existing) recordDelegation(host, ticket.id, { ...existing, state: 'failed', errorClass: exitClass(error, exitCode), endedAt: iso() })
+          if (existing) recordDelegation(host, ticket.id, { ...existing, state: notStarted ? 'not-started' : 'failed', errorClass: failureClass,
+            ...(notStarted ? { note: '尚未开始，可以重试同一张卡' } : {}), endedAt: iso() })
         })
         throw error
       }
@@ -356,7 +390,7 @@ export function fleetTools(host: Pick<ResourceHost, 'store' | 'context' | 'comma
           }
         })
       }
-      return { job_id: jobId, status: 'running' }
+      return { job_id: jobId, status: 'running', ...(worktree ? { worktree } : {}) }
     },
   })]
 }

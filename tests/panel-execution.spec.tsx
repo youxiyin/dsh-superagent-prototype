@@ -287,6 +287,8 @@ it('edits and saves every current fleet field and shows the cost summary returne
   await type(field<HTMLInputElement>(zh.fleetReportMaxChars), '20001')
   await type(field<HTMLInputElement>(zh.fleetAllowedChains), 'code, complex survey')
   await type(field<HTMLInputElement>(zh.fleetDelegationsPerTicket), '3')
+  expect(field<HTMLInputElement>(zh.fleetMaxConcurrent).value).toBe('2')
+  await type(field<HTMLInputElement>(zh.fleetMaxConcurrent), '5')
   await type(field<HTMLInputElement>(zh.fleetReviewRounds), '4')
   await click(find(zh.fleetAllowFree, '[role="switch"]'))
   await type(field<HTMLInputElement>(zh.fleetFreeMaterialSensitivity), 'public, internal')
@@ -294,9 +296,15 @@ it('edits and saves every current fleet field and shows the cost summary returne
   const request = server.requests.find(item => item.path === 'settings/executor' && item.method === 'PUT')
   expect(request?.body).toMatchObject({ value: { fleet: {
     enabled: true, bin: '/opt/fleet', timeoutMinutes: 181, reportMaxChars: 20001, allowedChains: ['code', 'complex', 'survey'],
-    delegationsPerTicket: 3, reviewRounds: 4, allowFree: true, freeMaterialSensitivity: ['public', 'internal'],
+    delegationsPerTicket: 3, maxConcurrent: 5, reviewRounds: 4, allowFree: true, freeMaterialSensitivity: ['public', 'internal'],
   } } })
-  expect(request?.body).not.toHaveProperty('value.fleet.maxConcurrent')
+  const submitted = request?.body as { value: { fleet: Record<string, unknown> } }
+  expect(Object.keys(submitted.value.fleet).sort()).toEqual(Object.keys(server.settings.executor.fleet).sort())
+  expect(server.settings.executor.fleet.maxConcurrent).toBe(5)
+  await remount(en)
+  await click(en['tab.execution'])
+  await click(find(en['tab.settings'], '.dt-status-head button'))
+  expect(field<HTMLInputElement>(en.fleetMaxConcurrent).value).toBe('5')
 })
 
 it('shows unknown rather than zero when fleet stats cannot be read', async () => {

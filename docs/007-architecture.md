@@ -346,6 +346,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/tools/fleet.ts` | Restricted host fleet argv and ticket-directory validation; background run and review |
 | `src/app/tools/fleet-delegation.ts` | A fleet run's `meta.json` as `RunOutcome`, its run directory from stdout, critic candidates, and `recordDelegation` |
+| `src/app/tools/fleet-card.ts` | Parse `card.md` budget fields and acceptance fences; reject an invalid card, chain mismatch or unauthorized free tier before any subprocess |
+| `src/app/tools/fleet-worktree.ts` | A clean detached Git worktree per card under `.fleet/worktrees`, idempotent exclude rule, and the non-repository fallback |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
@@ -422,6 +424,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/fleet-tool.spec.ts` | Fleet command allowlist, directory isolation, registration, argv and background lifecycle |
 | `tests/fleet-delegation.spec.ts` | Fleet run meta, run directories, critic evidence and delegation recording |
+| `tests/fleet-card.spec.ts` | Fleet card fields, acceptance fences, chain matching and free-tier authorization gates |
+| `tests/fleet-worktree.spec.ts` | Per-card Git worktree creation and reuse, exclude idempotence, symlink refusal and non-repository fallback |
 | `tests/relay-verbatim.spec.ts` | Worker report bodies delivered unchanged to local and Feishu Sources |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |

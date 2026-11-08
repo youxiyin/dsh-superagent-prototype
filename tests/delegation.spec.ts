@@ -4,11 +4,12 @@ import { SettingsSchema } from '../src/policy.ts'
 
 type Equal<Left, Right> = (<T>() => T extends Left ? 1 : 2) extends (<T>() => T extends Right ? 1 : 2) ? true : false
 type Expect<T extends true> = T
-type _State = Expect<Equal<Delegation['state'], 'carded' | 'running' | 'reported' | 'reviewing' | 'reviewed' | 'verdicted' | 'failed'>>
+type _State = Expect<Equal<Delegation['state'], 'carded' | 'running' | 'reported' | 'reviewing' | 'reviewed' | 'verdicted' | 'failed' | 'not-started'>>
 type _Role = Expect<Equal<Delegation['role'], 'builder' | 'reader' | 'mass'>>
 type _Verdict = Expect<Equal<Delegation['verdict'], 'pass' | 'rework' | 'escalate' | 'close'>>
 type _ReviewConclusion = Expect<Equal<Delegation['reviewConclusion'], 'pass' | 'rework' | 'unknown' | undefined>>
 type _OverrideReason = Expect<Equal<Delegation['overrideReason'], string | undefined>>
+type _Attempts = Expect<Equal<Delegation['attempts'], number | undefined>>
 
 describe('Delegation', () => {
   it('attaches a fully typed delegation to a ticket without requiring a display note', () => {
@@ -43,6 +44,7 @@ describe('fleet settings', () => {
     reportMaxChars: 20000,
     allowedChains: ['code', 'complex'],
     delegationsPerTicket: 2,
+    maxConcurrent: 2,
     reviewRounds: 3,
     allowFree: false,
     freeMaterialSensitivity: [],
@@ -51,7 +53,7 @@ describe('fleet settings', () => {
     expect(SettingsSchema.parse({}).executor.fleet).toEqual(defaults)
     expect(SettingsSchema.parse({ executor: { fleet: { enabled: true } } }).executor.fleet).toEqual({ ...defaults, enabled: true })
   })
-  it('preserves all nine configured fields', () => {
+  it('preserves all ten configured fields', () => {
     const fleet = {
       enabled: true,
       bin: 'custom-fleet',
@@ -59,11 +61,17 @@ describe('fleet settings', () => {
       reportMaxChars: 30000,
       allowedChains: ['bulk'],
       delegationsPerTicket: 4,
+      maxConcurrent: 6,
       reviewRounds: 5,
       allowFree: true,
       freeMaterialSensitivity: ['public'],
     }
     expect(SettingsSchema.parse({ executor: { fleet } }).executor.fleet).toEqual(fleet)
+  })
+  it('accepts maxConcurrent integers from 1 through 16 and rejects other values', () => {
+    const parse = (maxConcurrent: unknown) => SettingsSchema.safeParse({ executor: { fleet: { maxConcurrent } } })
+    for (const maxConcurrent of [1, 2, 16]) expect(parse(maxConcurrent).success).toBe(true)
+    for (const maxConcurrent of [0, 17, 1.5, '2']) expect(parse(maxConcurrent).success).toBe(false)
   })
   it('keeps the fleet settings strict', () => {
     expect(() => SettingsSchema.parse({ executor: { fleet: { unknown: true } } })).toThrow()

@@ -46,6 +46,10 @@ describe('ticketStage', () => {
   it.each(['carded', 'reviewed', 'verdicted', 'failed'] as const)('leaves a %s delegation on the ordinary working stage', state => {
     expect(ticketStage(ticket({ delegations: [delegation(state)] }))).toEqual({ stage: 'working' })
   })
+  it('does not mark a not-started delegation as delegating, unlike a running one', () => {
+    expect(ticketStage(ticket({ delegations: [delegation('not-started')] }))).toEqual({ stage: 'working' })
+    expect(ticketStage(ticket({ delegations: [delegation('running')] }))).toEqual({ stage: 'working', action: 'delegating' })
+  })
   it('keeps the original working stage with no delegations or an empty delegation list', () => {
     expect(ticketStage(ticket())).toEqual({ stage: 'working' })
     expect(ticketStage(ticket({ delegations: [] }))).toEqual({ stage: 'working' })

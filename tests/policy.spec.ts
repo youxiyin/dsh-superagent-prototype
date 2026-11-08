@@ -254,7 +254,7 @@ describe('settings migration', () => {
       sources: { feishu: feishuSource({ chats: [{ chatId: CHAT, listen: 'mentions' }, { chatId: OBSERVED, listen: 'all' }], directMessages: false }), github: { enabled: true, config: { pollSeconds: 120 } } },
       policy: { rules: [], sources: { feishu: { allowed: [{ id: MEMBER, name: 'A' }], admission: {} }, github: { allowed: [{ id: 'a' }], admission: {} } } },
       eval: { mode: 'auto', timeoutSeconds: 90, model: { provider: 'p', model: 'm' } },
-      executor: { model: null, maxWorkers: 5, directory: '', generalRoots: [], fleet: { enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] }, prepare: '', blockedCommands: [] },
+      executor: { model: null, maxWorkers: 5, directory: '', generalRoots: [], fleet: { enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, maxConcurrent: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] }, prepare: '', blockedCommands: [] },
     })
     expect(migrateSettings(migrated)).toEqual(migrated)
   })

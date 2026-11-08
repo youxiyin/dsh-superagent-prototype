@@ -282,9 +282,13 @@ export interface Delegation {
   id: string
   chain: string
   taskDir: string
+  /** The isolated worktree used by this delegation; absent on legacy ticket-directory delegations. */
+  worktree?: string
   role: 'builder' | 'reader' | 'mass'
   jobId: string
-  state: 'carded' | 'running' | 'reported' | 'reviewing' | 'reviewed' | 'verdicted' | 'failed'
+  state: 'carded' | 'running' | 'reported' | 'reviewing' | 'reviewed' | 'verdicted' | 'failed' | 'not-started'
+  /** Run attempts on this card; legacy records without this field count as one attempt. */
+  attempts?: number
   producer: { worker: string; family: string; routeId?: string; model?: string }
   critic: { worker: string; family: string }
   reviewJobId: string
@@ -314,6 +318,8 @@ export interface Ticket {
   attention?: Attention
   assignments: Assignment[]
   delegations?: Delegation[]
+  /** Host-created fleet worktrees by card slug, including cards that have not started running yet. */
+  fleetWorktrees?: Record<string, string>
   inputs: TicketInput[]
   /** Inputs not yet handed to a running assignment. */
   undelivered: string[]

@@ -148,6 +148,13 @@ interface DelegationStore {
   tickets: { get(id: string): Ticket | undefined; save(ticket: Ticket): void }
 }
 
+/** Register the worktree shared by a card and its delegation on the latest Ticket; the caller owns the transaction. */
+export function recordFleetWorktree(host: { store: DelegationStore }, ticketId: string, id: string, worktree: string): void {
+  const ticket = host.store.tickets.get(ticketId)
+  if (!ticket || ticket.fleetWorktrees?.[id] === worktree) return
+  host.store.tickets.save({ ...ticket, fleetWorktrees: { ...ticket.fleetWorktrees, [id]: worktree }, updatedAt: new Date().toISOString() })
+}
+
 /** Append this delegation on the latest Ticket; the caller owns the transaction. */
 export function recordDelegation(host: { store: DelegationStore }, ticketId: string, delegation: Delegation): void {
   const ticket = host.store.tickets.get(ticketId)

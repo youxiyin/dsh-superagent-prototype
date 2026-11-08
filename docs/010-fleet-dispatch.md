@@ -54,7 +54,7 @@ superagent 今天的执行链路是"一个 DSH Session 写完全部代码"：`ex
 - 参数在调用前全量校验（`:22-65`）：工人名匹配 `/^[A-Za-z0-9_@][A-Za-z0-9_.@-]*$/`；项目操作数必须等于工单目录；任务目录必须落在 `<工单目录>/.fleet/tasks/` 下且 realpath 一致（`:50-53`）；`.fleet` 不得是符号链接（`:44-49`）；`--role` 只收 `builder|reader|mass`（`:61`）；verdict 只收 `pass|rework|escalate|close`（`:63`）。
 - `run` 与 `review` 走后台 job，立即返回 `job_id`，完成后以 `steer` 消息 `fleet_result` 唤醒工人 Session（`:81-89`）。
 - 工具只在 `executor.fleet.enabled` 为真时注册，且每次调用重新检查开关（`:68-69`、`:77`）。
-- 配置项 `executor.fleet = { enabled, bin, timeoutMinutes, reportMaxChars }`（`src/policy.ts:98-103`），`enabled` 默认 false。
+- 配置项 `executor.fleet`（`src/policy.ts:98-120`，`.strict()`）共 10 个字段，`enabled` 默认 false；完整字段、类型与默认值见 §8.2 表。
 
 ### 2.4 提示词级"工头"契约
 

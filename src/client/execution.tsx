@@ -82,7 +82,8 @@ export function ExecutionSettings() {
     fleet: {
       ...executor.fleet, timeoutMinutes: String(executor.fleet.timeoutMinutes), reportMaxChars: String(executor.fleet.reportMaxChars),
       allowedChains: executor.fleet.allowedChains.join(' '), delegationsPerTicket: String(executor.fleet.delegationsPerTicket),
-      reviewRounds: String(executor.fleet.reviewRounds), freeMaterialSensitivity: executor.fleet.freeMaterialSensitivity.join(' '),
+      maxConcurrent: String(executor.fleet.maxConcurrent), reviewRounds: String(executor.fleet.reviewRounds),
+      freeMaterialSensitivity: executor.fleet.freeMaterialSensitivity.join(' '),
     },
   }
   const draft = useBlockDraft('executor', saved, blocks.executor.revision, value => ({
@@ -90,13 +91,13 @@ export function ExecutionSettings() {
     fleet: {
       ...value.fleet, timeoutMinutes: numberOf(value.fleet.timeoutMinutes), reportMaxChars: numberOf(value.fleet.reportMaxChars),
       allowedChains: value.fleet.allowedChains.split(/[\s,]+/).filter(Boolean),
-      delegationsPerTicket: numberOf(value.fleet.delegationsPerTicket), reviewRounds: numberOf(value.fleet.reviewRounds),
-      freeMaterialSensitivity: value.fleet.freeMaterialSensitivity.split(/[\s,]+/).filter(Boolean),
+      delegationsPerTicket: numberOf(value.fleet.delegationsPerTicket), maxConcurrent: numberOf(value.fleet.maxConcurrent),
+      reviewRounds: numberOf(value.fleet.reviewRounds), freeMaterialSensitivity: value.fleet.freeMaterialSensitivity.split(/[\s,]+/).filter(Boolean),
     },
   }))
   const value = draft.value
   const edit = (next: Partial<typeof value>) => draft.edit({ ...value, ...next })
-  const fleetNumber = (key: 'timeoutMinutes' | 'reportMaxChars' | 'delegationsPerTicket' | 'reviewRounds', label: string,
+  const fleetNumber = (key: 'timeoutMinutes' | 'reportMaxChars' | 'delegationsPerTicket' | 'maxConcurrent' | 'reviewRounds', label: string,
     min: number, max?: number) => <Field label={label}>
     <Input type="number" min={min} max={max} required value={value.fleet[key]}
       onChange={event => edit({ fleet: { ...value.fleet, [key]: event.target.value } })} />
@@ -138,6 +139,7 @@ export function ExecutionSettings() {
               onChange={event => edit({ fleet: { ...value.fleet, allowedChains: event.target.value } })} />
           </Field>
           {fleetNumber('delegationsPerTicket', t('fleetDelegationsPerTicket'), 1)}
+          {fleetNumber('maxConcurrent', t('fleetMaxConcurrent'), 1, 16)}
           {fleetNumber('reviewRounds', t('fleetReviewRounds'), 1)}
           {fleetSwitch('allowFree', t('fleetAllowFree'))}
           <Field label={t('fleetFreeMaterialSensitivity')} hint={t('fleetListHint')}>

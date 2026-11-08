@@ -1,5 +1,5 @@
 /** Host fleet tool restrictions and lifecycle on the real Runtime with an isolated simulated DSH host. */
-import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -23,17 +23,32 @@ let h: Host
 beforeEach(async () => { h = await startRuntime() })
 afterEach(async () => { await h.stop() })
 
+interface CardFixture {
+  taskType?: string
+  sensitivity?: string
+  free?: boolean
+  acceptance?: string
+  budget?: string
+}
+
+function writeCard(task: string, options: CardFixture = {}): void {
+  const acceptance = options.acceptance ?? '```sh\npnpm typecheck\n```'
+  const budget = options.budget ?? `- 任务类型：${options.taskType ?? 'complex'}（code/complex/bulk/survey/zh-text/visual）\n- 材料敏感度：${options.sensitivity ?? 'internal'}（public/internal/restricted）\n- 模态：text（text/image/video/computer）\n- 上下文需求：未声明（需要时写 token 正整数）\n- 质量级别：standard（standard/critical）\n- 时延目标：background（interactive/background）\n- 推理档位：default（按任务需要填写）${options.free ? '\n- 免费档：允许' : ''}`
+  writeFileSync(join(task, 'card.md'), `## 验收（明卷）\n${acceptance}\n\n## 预算与停止条件\n${budget}\n`)
+}
+
 async function worker(enabled = true, bin = 'fleet', timeoutMinutes = 180) {
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, enabled, bin, timeoutMinutes } } })
   const result = await h.acceptedTicket(feishu('1', '修复按钮'))
   const directory = result.ticket.execution!.directory, task = join(directory, '.fleet', 'tasks', 'test-card')
   mkdirSync(task, { recursive: true })
+  writeCard(task)
   return { ...result, directory, task, call: (argv: string[]) => h.runTool(result.sessionId, 'orchestrator_fleet', { argv }) }
 }
 
 it('defaults to disabled and never registers on a disabled worker or the main Session', async () => {
-  expect(SettingsSchema.parse({}).executor.fleet).toEqual({ enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] })
+  expect(SettingsSchema.parse({}).executor.fleet).toEqual({ enabled: false, bin: 'fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, maxConcurrent: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] })
   const { sessionId } = await worker(false)
   expect(h.tools.get(sessionId)?.has('orchestrator_fleet')).toBe(false)
   expect(h.tools.get(h.runtime.masterId)?.has('orchestrator_fleet')).toBe(false)
@@ -107,7 +122,7 @@ it('passes literal argv through real Commands.execFile without shell expansion',
 
 it('validates integer fleet timeout and report bounds and fills defaults in older fleet settings', () => {
   const parse = (fleet: Record<string, unknown>) => SettingsSchema.parse({ executor: { fleet } }).executor.fleet
-  expect(parse({ enabled: true, bin: 'custom-fleet' })).toEqual({ enabled: true, bin: 'custom-fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] })
+  expect(parse({ enabled: true, bin: 'custom-fleet' })).toEqual({ enabled: true, bin: 'custom-fleet', timeoutMinutes: 180, reportMaxChars: 20000, allowedChains: ['code', 'complex'], delegationsPerTicket: 2, maxConcurrent: 2, reviewRounds: 3, allowFree: false, freeMaterialSensitivity: [] })
   for (const value of [0, 601, 1.5]) expect(() => parse({ timeoutMinutes: value })).toThrow()
   for (const value of [999, 100001, 1000.5]) expect(() => parse({ reportMaxChars: value })).toThrow()
   expect(parse({ timeoutMinutes: 1, reportMaxChars: 1000 })).toMatchObject({ timeoutMinutes: 1, reportMaxChars: 1000 })
@@ -182,6 +197,7 @@ describe('background fleet commands', () => {
     await vi.waitFor(() => expect(h.deliveries.mock.calls.some(([d]) => d.text.includes('fleet failed'))).toBe(true))
     // A card slug is spent: a second delegation on this ticket needs a new card.
     const next = join(directory, '.fleet', 'tasks', 'test-card-2'); mkdirSync(next, { recursive: true })
+    writeCard(next)
     const pending = Promise.withResolvers<string>()
     vi.mocked(Commands.prototype.run).mockReturnValue(pending.promise)
     const signal = vi.spyOn(Commands.prototype, 'withSignal')
@@ -197,6 +213,89 @@ describe('background fleet commands', () => {
   })
 })
 
+describe('card contract and free-tier gates', () => {
+  it('lists missing and invalid fields before any subprocess and leaves the card unchanged', async () => {
+    const { call, task } = await worker()
+    writeCard(task, { budget: '- 任务类型：complex\n- 材料敏感度：secret\n- 模态：audio\n- 上下文需求：0' })
+    const before = readFileSync(join(task, 'card.md'), 'utf8')
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    const error = await call(['run', '@complex', task]).then(
+      () => { throw new Error('expected card rejection') },
+      (reason: unknown) => reason as Error,
+    )
+    for (const text of ['材料敏感度', '模态', '上下文需求', '质量级别', '时延目标', '推理档位', 'secret', 'audio']) {
+      expect(error.message).toContain(text)
+    }
+    expect(run).not.toHaveBeenCalled()
+    expect(readFileSync(join(task, 'card.md'), 'utf8')).toBe(before)
+  })
+
+  it('rejects a chain mismatch before any subprocess and names both values', async () => {
+    const { call, task } = await worker()
+    writeCard(task, { taskType: 'code' })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    const error = await call(['run', '@complex', task]).catch((reason: unknown) => reason as Error)
+    expect(error.message).toContain('card=code')
+    expect(error.message).toContain('run=@complex')
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('rejects a card without an sh acceptance fence before any subprocess', async () => {
+    const { call, task } = await worker()
+    writeCard(task, { acceptance: '```bash\npnpm typecheck\n```' })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['run', '@complex', task])).rejects.toThrow('验收')
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it.each(['internal', 'restricted'])('hard-rejects free-tier %s material despite an explicit whitelist', async sensitivity => {
+    const { call, task } = await worker()
+    writeCard(task, { sensitivity, free: true })
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, allowFree: true, freeMaterialSensitivity: [sensitivity] } } })
+    const before = readFileSync(join(task, 'card.md'), 'utf8')
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['run', '@complex', task])).rejects.toThrow('免费档硬拒绝')
+    expect(run).not.toHaveBeenCalled()
+    expect(readFileSync(join(task, 'card.md'), 'utf8')).toBe(before)
+  })
+
+  it('distinguishes the allowFree switch rejection for public free-tier material', async () => {
+    const { call, task } = await worker()
+    writeCard(task, { sensitivity: 'public', free: true })
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, allowFree: false, freeMaterialSensitivity: ['public'] } } })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['run', '@complex', task])).rejects.toThrow('executor.fleet.allowFree is off')
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('distinguishes the sensitivity whitelist rejection for public free-tier material', async () => {
+    const { call, task } = await worker()
+    writeCard(task, { sensitivity: 'public', free: true })
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, allowFree: true, freeMaterialSensitivity: [] } } })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(call(['run', '@complex', task])).rejects.toThrow('executor.fleet.freeMaterialSensitivity')
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('starts a public free-tier run only when enabled and whitelisted', async () => {
+    const { call, task, directory, sessionId } = await worker()
+    writeCard(task, { sensitivity: 'public', free: true })
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, allowFree: true, freeMaterialSensitivity: ['public'] } } })
+    const before = readFileSync(join(task, 'card.md'), 'utf8')
+    const pending = Promise.withResolvers<string>()
+    const run = vi.mocked(Commands.prototype.run); run.mockClear(); run.mockReturnValue(pending.promise)
+    expect(await call(['run', '@complex', task])).toMatchObject({ status: 'running' })
+    expect(run).toHaveBeenCalledWith('fleet', ['run', '@complex', task], directory, 180 * 60_000)
+    expect(readFileSync(join(task, 'card.md'), 'utf8')).toBe(before)
+    pending.resolve('done｜1.00 秒｜report.md 无｜')
+    await vi.waitFor(() => expect(runningJobs(h.ctx, sessionId)).toEqual([]))
+  })
+})
+
 describe('delegation placeholders, attribution and review prechecks', () => {
   const recorded = (patch: Partial<Delegation>): Delegation => ({
     id: 'test-card', chain: '@complex', taskDir: '/tmp/test-card', role: 'builder', jobId: 'fleet-0', state: 'reported',
@@ -207,6 +306,102 @@ describe('delegation placeholders, attribution and review prechecks', () => {
     const current = h.runtime.store.tickets.get(ticketId)!
     h.runtime.store.tickets.save({ ...current, delegations: [recorded(patch)] })
   }
+  const anotherWorker = async (triggerId: string) => {
+    const result = await h.acceptedTicket(feishu(triggerId, '另一工单'))
+    const directory = result.ticket.execution!.directory, task = join(directory, '.fleet', 'tasks', 'test-card')
+    mkdirSync(task, { recursive: true })
+    writeCard(task)
+    return { ...result, task, call: (argv: string[]) => h.runTool(result.sessionId, 'orchestrator_fleet', { argv }) }
+  }
+
+  it.each(['running', 'reviewing'] as const)('rejects a cross-ticket %s delegation at the configured concurrency cap before execution', async state => {
+    const other = await worker()
+    const current = await anotherWorker('2')
+    const otherTicket = h.runtime.store.tickets.get(other.ticket.id)!
+    h.runtime.store.tickets.save({ ...otherTicket, delegations: [recorded({ state })] })
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, maxConcurrent: 1 } } })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(current.call(['run', '@complex', current.task])).rejects.toThrow('1/1')
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('admits only one of two simultaneous runs and writes no placeholder for the rejected ticket', async () => {
+    const first = await worker()
+    const second = await anotherWorker('2')
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, maxConcurrent: 1 } } })
+    const pending = Promise.withResolvers<string>()
+    const run = vi.mocked(Commands.prototype.run)
+    run.mockClear()
+    run.mockReturnValue(pending.promise)
+    const callers = [first, second]
+    try {
+      const results = await Promise.allSettled(callers.map(({ call, task }) => call(['run', '@complex', task])))
+      expect(results.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected'])
+      const rejectedIndex = results.findIndex(result => result.status === 'rejected')
+      const fulfilledIndex = results.findIndex(result => result.status === 'fulfilled')
+      const rejected = results[rejectedIndex] as PromiseRejectedResult
+      expect(String(rejected.reason)).toContain('1/1')
+      expect(run).toHaveBeenCalledTimes(1)
+      expect(h.runtime.store.tickets.get(callers[rejectedIndex]!.ticket.id)?.delegations ?? []).toEqual([])
+      expect(h.runtime.store.tickets.get(callers[fulfilledIndex]!.ticket.id)?.delegations).toMatchObject([{ state: 'running', attempts: 1 }])
+    } finally {
+      pending.resolve('done｜1.00 秒｜report.md 无｜')
+      await vi.waitFor(() => {
+        expect(runningJobs(h.ctx, first.sessionId)).toEqual([])
+        expect(runningJobs(h.ctx, second.sessionId)).toEqual([])
+      })
+    }
+  })
+
+  it('starts below the concurrency cap and does not count reported, failed or not-started records', async () => {
+    const other = await worker()
+    const current = await anotherWorker('2')
+    const otherTicket = h.runtime.store.tickets.get(other.ticket.id)!
+    h.runtime.store.tickets.save({ ...otherTicket, delegations: [
+      recorded({ id: 'running', state: 'running' }), recorded({ id: 'reported', state: 'reported' }),
+      recorded({ id: 'failed', state: 'failed' }), recorded({ id: 'not-started', state: 'not-started' }),
+    ] })
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, maxConcurrent: 2 } } })
+    const pending = Promise.withResolvers<string>()
+    vi.mocked(Commands.prototype.run).mockReturnValue(pending.promise)
+    expect(await current.call(['run', '@complex', current.task])).toMatchObject({ status: 'running' })
+    pending.resolve('done｜1.00 秒｜report.md 无｜')
+    await vi.waitFor(() => expect(h.runtime.store.tickets.get(current.ticket.id)?.delegations?.at(-1)?.state).toBe('failed'))
+  })
+
+  it('records exit 3 as not-started, retries one record with attempts and rejects the third run', async () => {
+    const { call, task, ticket } = await worker()
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, delegationsPerTicket: 1 } } })
+    const run = vi.mocked(Commands.prototype.run)
+    run.mockImplementation(async () => { throw new CliError('fleet exited with code 3', undefined, 3) })
+    const record = () => h.runtime.store.tickets.get(ticket.id)?.delegations
+    await call(['run', '@complex', task])
+    await vi.waitFor(() => expect(record()?.at(-1)?.state).toBe('not-started'))
+    expect(record()).toMatchObject([{ id: 'test-card', attempts: 1, errorClass: 'fleet-exit-3', note: '尚未开始，可以重试同一张卡' }])
+    await call(['run', '@complex', task])
+    await vi.waitFor(() => expect(record()?.at(-1)).toMatchObject({ state: 'not-started', attempts: 2 }))
+    expect(record()).toHaveLength(1)
+    expect(record()?.at(-1)).toMatchObject({ state: 'not-started', errorClass: 'fleet-exit-3', note: '尚未开始，可以重试同一张卡' })
+    run.mockClear()
+    await expect(call(['run', '@complex', task])).rejects.toThrow(/升级交人工|escalate/)
+    expect(run).not.toHaveBeenCalled()
+    expect(record()).toHaveLength(1)
+    expect(record()?.at(-1)?.attempts).toBe(2)
+  })
+
+  it('treats a legacy not-started record without attempts as one attempt on retry', async () => {
+    const { call, task, ticket } = await worker()
+    seed(ticket.id, { state: 'not-started', errorClass: 'fleet-exit-3', attempts: undefined })
+    vi.mocked(Commands.prototype.run).mockImplementation(async () => { throw new CliError('fleet exited with code 3', undefined, 3) })
+    await call(['run', '@complex', task])
+    const record = () => h.runtime.store.tickets.get(ticket.id)?.delegations
+    await vi.waitFor(() => expect(record()?.at(-1)).toMatchObject({ state: 'not-started', attempts: 2 }))
+    expect(record()).toHaveLength(1)
+  })
 
   it('writes the running placeholder before the command starts and refuses a reused card', async () => {
     const { call, task, ticket } = await worker()
@@ -224,6 +419,23 @@ describe('delegation placeholders, attribution and review prechecks', () => {
     expect(h.runtime.store.tickets.get(ticket.id)?.delegations?.at(-1)).toMatchObject({
       producer: { worker: '', family: '' }, errorClass: 'missing-run-dir',
     })
+  })
+
+  it('refuses reported to reviewing at the concurrency cap before critic discovery', async () => {
+    const current = await worker()
+    const other = await anotherWorker('2')
+    seed(current.ticket.id)
+    const otherTicket = h.runtime.store.tickets.get(other.ticket.id)!
+    h.runtime.store.tickets.save({ ...otherTicket, delegations: [
+      recorded({ id: 'running-1', state: 'running' }), recorded({ id: 'running-2', state: 'running' }),
+    ] })
+    const settings = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fleet: { ...settings.executor.fleet, maxConcurrent: 2 } } })
+    const run = vi.mocked(Commands.prototype.run); run.mockClear()
+    await expect(current.call(['review', current.task])).rejects.toThrow('2/2')
+    expect(run).not.toHaveBeenCalled()
+    expect(h.runtime.store.tickets.get(current.ticket.id)?.delegations?.at(-1)).toMatchObject({ state: 'reported', reviewJobId: '' })
+    expect(runningJobs(h.ctx, current.sessionId)).toEqual([])
   })
 
   it('refuses a review with no candidate and leaves the delegation reported', async () => {
